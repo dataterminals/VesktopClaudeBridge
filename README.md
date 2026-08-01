@@ -79,9 +79,17 @@ git clone https://github.com/Equicord/Equicord.git D:/Equicord
 .\scripts\install-plugin.ps1 -EquicordPath D:\Equicord -Build
 ```
 
-Then point Vesktop at `D:\Equicord\dist` (Vesktop settings → *Vencord Location*) and restart it. Enable **VesktopClaudeBridge** in Equicord settings, paste the token into its settings field, and reload Discord (`Ctrl+R`).
+The first run installs Equicord's own dependencies, so give it a few minutes. If `pnpm` can't self-switch to the version pinned in Equicord's `packageManager` field, the script retries with whatever `pnpm` is on your `PATH`.
 
-The token box clears itself on reload — that's intentional. Vencord's cloud settings sync uploads the settings blob to `api.vencord.dev`, so the plugin moves the token into `localStorage` instead, where it stays on this machine.
+Then point Vesktop at **`D:\Equicord\dist\equibop`** (Vesktop settings → *Vencord Location*) and restart it. Enable **VesktopClaudeBridge** in Equicord settings, paste the token into its settings field, and reload Discord (`Ctrl+R`).
+
+`dist\equibop`, not `dist` and not `dist\desktop`. Vesktop `require()`s the Vencord main from that folder, and the two builds are not interchangeable: `dist\desktop\patcher.js` is the Discord `app.asar` injector and pulls in `discord_desktop_core`. Hand Vesktop that one and it hangs on the splash screen with no error in any log. Equibop is Equicord's Vesktop fork, so `dist\equibop` is the "host app loads Vencord" build.
+
+Vesktop also validates the folder against Vencord's *release asset* names (`vencordDesktopMain.js` and friends), which Equicord doesn't build — so a stock Equicord dist is rejected as "invalid". `-Build` writes those four names in beside the real ones for you. They're copies of build output, so re-run the script after every Equicord rebuild rather than aliasing once by hand.
+
+The token box clears itself on reload — that's intentional. Vencord's cloud settings sync uploads the settings blob to a remote host, so the plugin moves the token into `localStorage` instead, where it stays on this machine.
+
+One surprise worth knowing: once Vesktop is loading Equicord from a custom *Vencord Location*, Equicord keeps its settings in **`%APPDATA%\Equicord\settings`**, not `%APPDATA%\vesktop\settings`. That folder is empty until you do this, which makes it easy to spend a while editing a file nothing reads.
 
 ### 3. Wire up MCP
 
@@ -90,6 +98,13 @@ claude mcp add discord -- node "D:/Github Repositories/VesktopClaudeBridge/sidec
 ```
 
 Check it took with `discord_status`. If it says `no_client`, Vesktop isn't running or the plugin isn't enabled.
+
+**Only one sidecar can run at a time.** It binds two loopback ports, so a second one exits immediately with `EADDRINUSE` — which Claude Code surfaces as the much less helpful `Failed to connect: Connection closed`. If you've got a sidecar running by hand (`npm start`), stop it before letting Claude Code spawn its own. The plugin reconnects on its own within ~15s of a sidecar appearing, so you don't need to reload Discord when sessions come and go.
+
+If port 8787 is already taken on your machine, change it in **both** halves or the plugin will dial a socket nothing is listening on:
+
+- `%APPDATA%\vesktop-claude-bridge\config.json` → `port` (the HTTP mirror defaults to `port + 1`)
+- the plugin's **Port** setting in Equicord settings
 
 ## Tools
 
@@ -108,6 +123,8 @@ Everything is also on `http://127.0.0.1:8788` with `Authorization: Bearer <token
 ```bash
 curl -s -H "Authorization: Bearer $(npm --prefix sidecar run --silent token)" http://127.0.0.1:8788/current-view
 ```
+
+This is also the fastest way to debug the bridge itself, since it doesn't need MCP wired up or a session restart to pick up changes.
 
 ## Tests
 

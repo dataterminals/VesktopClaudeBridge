@@ -32,9 +32,19 @@ History always goes to REST, through the client's own `RestAPI`. That's the same
 
 ## Why the token isn't in plugin settings
 
-Vencord's cloud settings sync uploads the settings blob to `api.vencord.dev`. A token parked in a settings field would ride along with it. So the settings field is a one-way inbox — `start()` moves the value into `localStorage` (per-install, never synced) and blanks the field.
+Vencord's cloud settings sync uploads the settings blob to a remote host. A token parked in a settings field would ride along with it. So the settings field is a one-way inbox — `start()` moves the value into `localStorage` (per-install, never synced) and blanks the field.
 
 This looks like a bug the first time you see it. It isn't.
+
+### `localStorage` has to come from `@utils/localStorage`
+
+Discord deletes `window.localStorage` from the renderer during boot. By the time a plugin's `start()` runs, the bare global is `undefined` and every access throws.
+
+This was the one bug that made it all the way to the first live run, and it's worth understanding why it survived review: `getToken()` wraps its read in a `try/catch` returning `""`, which is the right shape for "storage is disabled" but here turned a hard failure into a silent one. The bridge did exactly what it's supposed to do when there's no token — declined to open a socket and reported `no token set` — so the symptom pointed at the settings field, which was fine, rather than at storage, which was gone. It typechecks, and there's no way to catch it without a live client.
+
+Vencord's own bundle runs before Discord's delete and re-exports the captured `Storage` object from `@utils/localStorage`. Import from there, never the global. Vencord uses it for its own cloud-sync flags for exactly this reason.
+
+The general lesson for this plugin: a `catch` that returns a falsy default will hide a missing browser global, and every store call in `discord.ts` is written in that same defensive style. That's the right call for field renames, but it means "empty result" and "API gone" look identical from the outside. When something comes back empty, check the thing exists at all before assuming the shape changed.
 
 ## Why the loopback socket needs auth at all
 
@@ -60,6 +70,12 @@ Everything Discord-facing is version-sensitive. In rough order of likelihood:
 | `Constants.Endpoints.MESSAGES` | `discord.ts` → `fetchMessages` | history throws immediately |
 | Message record field names | `discord.ts` normalisers | fields come back null |
 
+All five were checked against a live client on 2026-08-01 (Equicord 1.15.0.2, Vesktop 1.6.5) and all five held. Recorded so the next person knows what "working" looked like:
+
+- `GuildChannelStore.getChannels()` returns `{ "4": [...], SELECTABLE: [...], VOCAL: [...], id, count }`. The non-array `id`/`count` keys are why `listChannels` skips non-arrays. Dropping types 4 and 2 left 22 text + 2 announcement + 3 forum = the 27 the tool reported.
+- The context menu item lands as `message-vcb-mark-for-claude`, and the chat-bar button renders as a `div[role=button]` whose `aria-label` interpolates `grabCount` — not a `<button>`, which matters if you go looking for it in the DOM.
+- Reply resolution behaves differently by path, by design and visibly: `current_view` reads the cache and resolves reply bodies that the REST path returns as `unresolved`, because Discord doesn't always inline `referenced_message`.
+
 The normalisers are deliberately defensive — every field read is optional-chained with a fallback — so a rename degrades one field rather than throwing. If something comes back empty, start at the store call, not the transcript.
 
 Verify changes by typechecking against a real checkout rather than guessing:
@@ -76,3 +92,5 @@ cd <equicord> && npx tsc --noEmit
 - **Forum channels** appear in `discord_channels` but their threads don't; `discord_threads` isn't built yet.
 - **No search.** Discord's search endpoint is the obvious next addition and the highest-value one — scrolling back through months of history via `before` is the wrong tool for "find where someone mentioned this".
 - **Attachment urls expire.** `discord_fetch_attachment` re-reads the message to mint a fresh signature rather than trusting a url from an earlier tool result. Don't cache them.
+- **Unresolved replies aren't retried.** Discord's REST doesn't always inline `referenced_message`, so `discord_history` can render `replying to someone (body not loaded)` for a message that is still perfectly fetchable — confirmed live: a reply target that came back unresolved was readable via `around=<id>` a moment later. `current_view` doesn't show this because the cache has the body. Fixing it means either a second fetch per unresolved reply or resolving against the page already in hand, which only helps when the target is in the same window. Left alone for now because the flag is honest about what happened, but it's the cheapest remaining win in transcript quality.
+- **One sidecar per machine.** It binds two loopback ports and exits on `EADDRINUSE`, so a hand-started sidecar and a Claude-Code-spawned one can't coexist. The failure surfaces as `Connection closed`, which doesn't point anywhere near the real cause.

@@ -4,6 +4,7 @@
  */
 
 import { definePluginSettings } from "@api/Settings";
+import { localStorage } from "@utils/localStorage";
 import { OptionType } from "@utils/types";
 
 import { DEFAULT_PORT } from "./protocol";
@@ -12,12 +13,19 @@ import { DEFAULT_PORT } from "./protocol";
  * Where the bridge token actually lives.
  *
  * NOT in plugin settings. Vencord's cloud settings sync uploads the whole
- * settings blob to api.vencord.dev, and this user has that switched on — a
- * token parked in a settings field would ride along with it. localStorage is
- * per-install and never synced, so the secret stays on this machine.
+ * settings blob to the configured cloud host — a token parked in a settings
+ * field would ride along with it. localStorage is per-install and never
+ * synced, so the secret stays on this machine.
  *
  * The settings field below is a one-way inbox: you paste into it, `start()`
  * moves the value here and blanks the field.
+ *
+ * The import above is load-bearing. Discord deletes `window.localStorage` from
+ * the renderer during boot, so the bare global is `undefined` by the time a
+ * plugin runs — every read would throw, get swallowed by the try/catch below,
+ * and the bridge would sit there reporting "no token set" forever. Vencord's
+ * bundle runs before that delete happens and re-exports the captured Storage
+ * object, which keeps working. Don't "simplify" this back to the global.
  */
 const TOKEN_KEY = "VesktopClaudeBridge_token";
 
