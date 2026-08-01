@@ -18,7 +18,13 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { fetchAttachment } from "./attachments.js";
 import { BridgeError, type BridgeServer } from "./bridge-server.js";
 import type { Config } from "./config.js";
-import { Pseudonymizer, assertAllowed, renderSearchResults, renderTranscript } from "./format.js";
+import {
+    Pseudonymizer,
+    assertAllowed,
+    compactMessages,
+    renderSearchResults,
+    renderTranscript
+} from "./format.js";
 import { log } from "./log.js";
 
 export function startHttpApi(bridge: BridgeServer, cfg: Config): Server {
@@ -129,6 +135,43 @@ export function startHttpApi(bridge: BridgeServer, cfg: Config): Server {
                     return wantJson
                         ? sendJson(res, 200, out)
                         : send(res, 200, render(null, out.channel, out.messages) + "\n");
+                }
+
+                case "/live": {
+                    // The UserPromptSubmit hook curls this on every message the
+                    // user sends, so it has to be cheap and it has to stay quiet
+                    // when there's nothing to say — a hook that always prints
+                    // something is a hook that gets turned off.
+                    const out = await bridge.call("third_eye.drain", {
+                        notableOnly: q.get("notableOnly") === "1",
+                        consume: q.get("consume") !== "0",
+                        limit: limit ?? 100
+                    });
+
+                    if (wantJson) return sendJson(res, 200, out);
+                    if (!out.state.watching && !out.messages.length) return send(res, 200, "");
+                    if (!out.messages.length) return send(res, 200, "");
+
+                    assertAllowed(cfg, out.state.channel);
+
+                    const where = out.state.channel ? `#${out.state.channel.name}` : "(unknown)";
+                    const gap = out.dropped
+                        ? `\n(gap: ${out.dropped} message(s) fell out of the buffer unread)`
+                        : "";
+                    const body = compactMessages(pseudo.apply(out.messages.map(m => m.message)), {
+                        truncateAt: cfg.truncateAt,
+                        stamp: "datetime"
+                    });
+                    return send(
+                        res,
+                        200,
+                        `Third eye · ${where} · ${out.messages.length} new${gap}\n\n${body}\n`
+                    );
+                }
+
+                case "/third-eye": {
+                    const st = await bridge.call("third_eye.state", {});
+                    return sendJson(res, 200, st);
                 }
 
                 case "/search": {

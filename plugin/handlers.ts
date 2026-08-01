@@ -21,6 +21,7 @@ import {
     toBridgeGuild
 } from "./discord";
 import { clearMarks, listMarks } from "./marked";
+import { drain as drainThirdEye, noteRead, state as thirdEyeState } from "./thirdEye";
 import type { RpcMethod, RpcParams, RpcResults } from "./protocol";
 import { settings } from "./settings";
 
@@ -140,6 +141,20 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
 
     async "marked.clear"(params: RpcParams["marked.clear"]): Promise<RpcResults["marked.clear"]> {
         return { cleared: clearMarks(params?.markId) };
+    },
+
+    async "third_eye.state"(): Promise<RpcResults["third_eye.state"]> {
+        return thirdEyeState();
+    },
+
+    async "third_eye.drain"(params: RpcParams["third_eye.drain"]): Promise<RpcResults["third_eye.drain"]> {
+        // Light the icon: a drain is the moment this mode starts costing tokens.
+        noteRead();
+        return drainThirdEye({
+            consume: params?.consume ?? false,
+            notableOnly: params?.notableOnly ?? false,
+            limit: params?.limit
+        });
     },
 
     async guilds(): Promise<RpcResults["guilds"]> {

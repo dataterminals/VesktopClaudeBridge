@@ -1,0 +1,15 @@
+{
+    "hooks": {
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "node \"D:/Github Repositories/VesktopClaudeBridge/scripts/third-eye-hook.mjs\"",
+                        "timeout": 5
+                    }
+                ]
+            }
+        ]
+    }
+}

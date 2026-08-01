@@ -147,6 +147,38 @@ export interface MarkedItem {
     messages: BridgeMessage[];
 }
 
+/**
+ * A message the third-eye watcher captured on its own.
+ *
+ * `notable` is what earns an interruption; everything else just accumulates and
+ * is read later. Capture is free — it costs no model — so the buffer keeps
+ * everything and the filtering happens at the point where it would cost tokens.
+ */
+export interface LiveMessage {
+    message: BridgeMessage;
+    /** Mention of you, reply to you, or a term you named. */
+    notable: boolean;
+    /** Which rule fired, so a digest can say why without re-deriving it. */
+    reason: "mention" | "reply" | "term" | null;
+}
+
+export interface ThirdEyeState {
+    watching: boolean;
+    guild: BridgeGuild | null;
+    channel: BridgeChannel | null;
+    /** When the watch started, and when it will lapse on its own. */
+    since: string | null;
+    expiresAt: string | null;
+    /** Buffered but not yet drained. */
+    pending: number;
+    notablePending: number;
+    /** Lifetime counters, so "is this a firehose?" is measured, not guessed. */
+    seen: number;
+    matched: number;
+    /** Messages the ring evicted before anything read them. */
+    dropped: number;
+}
+
 // ---------------------------------------------------------------------------
 // RPC surface
 // ---------------------------------------------------------------------------
@@ -159,6 +191,8 @@ export type RpcMethod =
     | "resolve_link"
     | "marked.list"
     | "marked.clear"
+    | "third_eye.state"
+    | "third_eye.drain"
     | "guilds"
     | "channels";
 
@@ -193,6 +227,9 @@ export interface RpcParams {
     resolve_link: { url: string; context?: number; };
     "marked.list": { consume?: boolean; };
     "marked.clear": { markId?: number; };
+    "third_eye.state": Record<string, never>;
+    /** Reading is the only part that costs anything, so it's explicit. */
+    "third_eye.drain": { consume?: boolean; notableOnly?: boolean; limit?: number; };
     guilds: Record<string, never>;
     channels: { guildId: string; };
 }
@@ -223,6 +260,16 @@ export interface RpcResults {
     };
     "marked.list": { items: MarkedItem[]; };
     "marked.clear": { cleared: number; };
+    "third_eye.state": ThirdEyeState;
+    "third_eye.drain": {
+        state: ThirdEyeState;
+        messages: LiveMessage[];
+        /**
+         * Evicted before anything read them. Surfaced rather than swallowed, on
+         * the same principle as truncation: a gap you know about is recoverable.
+         */
+        dropped: number;
+    };
     guilds: { guilds: BridgeGuild[]; };
     channels: { channels: BridgeChannel[]; };
 }
@@ -272,10 +319,16 @@ export type ResFrame =
     | { t: "res"; id: string; ok: true; data: unknown; }
     | { t: "res"; id: string; ok: false; error: RpcError; };
 
-/** plugin -> sidecar, unsolicited. */
+/**
+ * plugin -> sidecar, unsolicited.
+ *
+ * Adding an event name is backward compatible in the direction that matters — an
+ * older plugin simply never sends it — so this does not move PROTOCOL_VERSION.
+ * Bumping it would close(4426) every tool on a half-upgraded install.
+ */
 export interface EventFrame {
     t: "event";
-    event: "marked" | "view-changed";
+    event: "marked" | "view-changed" | "third-eye";
     data: unknown;
 }
 

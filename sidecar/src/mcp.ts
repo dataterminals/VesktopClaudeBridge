@@ -20,6 +20,7 @@ import {
     Pseudonymizer,
     assertAllowed,
     channelTypeName,
+    compactMessages,
     renderSearchResults,
     renderTranscript
 } from "./format.js";
@@ -181,6 +182,77 @@ export function createMcpServer(bridge: BridgeServer, cfg: Config, version: stri
                 });
                 assertAllowed(cfg, res.channel);
                 return text(transcript(null, res.channel, res.messages, ids));
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_live",
+        {
+            title: "Read what third eye has been watching",
+            description:
+                "Drain the buffer the user's 'third eye' has been quietly filling from a channel they're watching. Use this when they refer to what's been happening, what someone said while they were working, or ask you to catch up — and whenever a message hints they've had it running. Returns nothing when it isn't on, which is cheap: this is a pull, so DO NOT poll it. Capture costs the user nothing; reading is the only part that spends anything, so read once and act on it rather than checking repeatedly.",
+            inputSchema: {
+                notableOnly: z
+                    .boolean()
+                    .optional()
+                    .describe("Only messages that mentioned them, replied to them, or matched a term they named. Much cheaper — try this first when catching up after a long gap."),
+                consume: z
+                    .boolean()
+                    .optional()
+                    .describe("Clear what you read, so the next call returns only what is new. Prefer true once you've actually acted on it."),
+                limit: z.number().int().optional().describe("Cap on messages returned (default 100)."),
+                ids: z.boolean().optional().describe("Tag every message with its id.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ notableOnly, consume, limit, ids }): Promise<TextResult> => {
+            try {
+                const res = await bridge.call("third_eye.drain", {
+                    notableOnly: notableOnly ?? false,
+                    consume: consume ?? false,
+                    limit: limit ?? 100
+                });
+                const st = res.state;
+
+                if (!st.watching && !res.messages.length) {
+                    return text(
+                        "Third eye isn't running. The user turns it on from the chat-bar button in Discord — it captures quietly and costs nothing until this tool reads it."
+                    );
+                }
+
+                // The plugin already refuses to watch DMs, but the guard is
+                // cheap and this is the boundary where content becomes context.
+                assertAllowed(cfg, st.channel);
+
+                const where = st.channel ? `#${st.channel.name}` : "(unknown channel)";
+                const head = [
+                    `── third eye · ${where}${st.guild ? ` · ${st.guild.name}` : ""}`,
+                    `── ${res.messages.length} shown · ${st.pending} buffered · ${st.notablePending} for you · ${st.seen} seen, ${st.matched} matched since it started`
+                ];
+                if (res.dropped) {
+                    head.push(`── (gap: ${res.dropped} message(s) fell out of the buffer before anything read them)`);
+                }
+                if (!st.watching) head.push("── the watch has since stopped");
+
+                if (!res.messages.length) {
+                    return text(`${head.join("\n")}\n\nNothing new.`);
+                }
+
+                const body = compactMessages(pseudo.apply(res.messages.map(m => m.message)), {
+                    truncateAt: cfg.truncateAt,
+                    ids: ids ?? false,
+                    stamp: "datetime"
+                });
+
+                const flagged = res.messages.filter(m => m.notable);
+                const why = flagged.length
+                    ? `\n\nFor you: ${flagged.map(m => `${m.message.author.displayName} (${m.reason})`).join(", ")}`
+                    : "";
+
+                return text(`${head.join("\n")}\n\n${body}${why}`);
             } catch (err) {
                 return failure(err);
             }

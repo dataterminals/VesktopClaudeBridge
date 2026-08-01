@@ -9,7 +9,14 @@
  * side answering.
  */
 
-import { PROTOCOL_VERSION, type BridgeUser, type RpcError, type RpcMethod, type SidecarFrame } from "./protocol";
+import {
+    PROTOCOL_VERSION,
+    type BridgeUser,
+    type EventFrame,
+    type RpcError,
+    type RpcMethod,
+    type SidecarFrame
+} from "./protocol";
 import { getToken, settings } from "./settings";
 
 export const PLUGIN_VERSION = "0.1.0";
@@ -167,7 +174,7 @@ export class BridgeClient {
     }
 
     /** Fire-and-forget notification to the sidecar. */
-    notify(event: "marked" | "view-changed", data: unknown): void {
+    notify(event: EventFrame["event"], data: unknown): void {
         if (!this.connected) return;
         this.socket!.send(JSON.stringify({ t: "event", event, data }));
     }

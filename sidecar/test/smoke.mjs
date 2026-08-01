@@ -94,6 +94,17 @@ const SEARCH_HITS = [
     }
 ];
 
+const THIRD_EYE_STATE = {
+    watching: true, guild: GUILD, channel: CHANNEL,
+    since: "2026-08-01T14:00:00.000Z", expiresAt: "2026-08-01T18:00:00.000Z",
+    pending: 2, notablePending: 1, seen: 412, matched: 7, dropped: 2
+};
+
+const LIVE = [
+    { message: MESSAGES[0], notable: false, reason: null },
+    { message: MESSAGES[1], notable: true, reason: "mention" }
+];
+
 // --- fake plugin -----------------------------------------------------------
 
 function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
@@ -134,6 +145,16 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
                         }] });
                     case "guilds":
                         return answer({ guilds: [GUILD] });
+                    case "third_eye.state":
+                        return answer(THIRD_EYE_STATE);
+                    case "third_eye.drain":
+                        return answer({
+                            state: THIRD_EYE_STATE,
+                            messages: frame.params?.notableOnly
+                                ? LIVE.filter(m => m.notable)
+                                : LIVE,
+                            dropped: 2
+                        });
                     case "search":
                         return answer({
                             guild: GUILD, totalResults: 385, hits: SEARCH_HITS,
@@ -267,6 +288,19 @@ try {
     check("forwards `after` to the plugin", received.history?.after === "3000");
     check("forwards `before` alongside it", received.history?.before === "3100");
     check("does not silently drop one anchor", !!received.history?.after && !!received.history?.before);
+
+    console.log("\nthird eye");
+    const live = await (await get("/live")).text();
+    check("names the watched channel", live.includes("#modding-help"));
+    check("surfaces the gap rather than swallowing it", live.includes("2 message(s) fell out"));
+    check("stamps live lines with the date", live.includes("[2026-08-01 14:31:02]"));
+    check("code fence survives the live path", live.includes("\n```\n[2026.08.01-14.32.55:123][  0]LogUE4SS: mod folder not found\n```"));
+    // The hook runs on every keystroke-submitted message; a chatty default gets it disabled.
+    check("consumes by default so the hook doesn't repeat itself", received["third_eye.drain"]?.consume === true);
+    check("notableOnly is forwarded", (await get("/live?notableOnly=1")).status === 200 && received["third_eye.drain"]?.notableOnly === true);
+
+    const teState = await (await get("/third-eye")).json();
+    check("state exposes the volume counters", teState.seen === 412 && teState.matched === 7);
 
     console.log("\nsearch");
     const search = await (await get("/search?guildId=1000&content=pak")).text();

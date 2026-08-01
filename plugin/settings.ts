@@ -78,6 +78,19 @@ export const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Show a toast when something is marked or when the bridge connects.",
         default: true
+    },
+    thirdEyeTerms: {
+        type: OptionType.STRING,
+        description:
+            "Third eye: comma-separated words that count as worth surfacing even when nobody mentions you — a repo name, a mod name, a build number. Conversations about your work often never name you.",
+        default: "",
+        placeholder: "UnkillablesRebalance, TFWorkbench, v0.1.7"
+    },
+    thirdEyeIncludeBots: {
+        type: OptionType.BOOLEAN,
+        description:
+            "Third eye: also watch bot and webhook messages. Off by default — a CI bot posting build logs is the highest-volume thing in most channels.",
+        default: false
     }
 });
 
