@@ -295,15 +295,18 @@ export interface HistoryQuery {
 }
 
 /**
- * Goes to the API for history the cache doesn't hold.
+ * Discord's hard ceiling on `limit` for GET /channels/:id/messages.
  *
- * This rides the client's own authenticated REST layer, so it is the same
- * request the app would make if you scrolled up — no separate token, no bot.
+ * Asking for more is not clamped server-side, it's a 400 — so anything above
+ * this has to be paged rather than requested in one go.
  */
-export async function fetchMessages(query: HistoryQuery): Promise<BridgeMessage[]> {
-    const channel = toBridgeChannel(ChannelStore.getChannel(query.channelId));
+const MAX_PER_REQUEST = 100;
 
-    const params: Record<string, string | number> = { limit: query.limit };
+/** One REST page, newest-first, exactly as Discord returns it. */
+async function fetchPage(query: HistoryQuery): Promise<any[]> {
+    const params: Record<string, string | number> = {
+        limit: Math.min(query.limit, MAX_PER_REQUEST)
+    };
     if (query.before) params.before = query.before;
     if (query.after) params.after = query.after;
     if (query.around) params.around = query.around;
@@ -325,9 +328,97 @@ export async function fetchMessages(query: HistoryQuery): Promise<BridgeMessage[
         );
     }
 
-    const body: any[] = Array.isArray(response?.body) ? response.body : [];
-    // The API returns newest-first; everything downstream assumes chronological.
-    return body.reverse().map(m => toBridgeMessage(m, channel));
+    return Array.isArray(response?.body) ? response.body : [];
+}
+
+/** Snowflakes sort chronologically, but they're strings and outgrow Number. */
+function snowflakeAsc(a: string, b: string): number {
+    const x = BigInt(a);
+    const y = BigInt(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/**
+ * Goes to the API for history the cache doesn't hold.
+ *
+ * This rides the client's own authenticated REST layer, so it is the same
+ * request the app would make if you scrolled up — no separate token, no bot.
+ *
+ * Anything over `MAX_PER_REQUEST` is paged, because Discord rejects a bigger
+ * `limit` outright rather than returning what it can. Which way we walk depends
+ * on the anchor:
+ *
+ *  - `after`  walks *forward* from the newest id of each page, so "this message
+ *    and everything after it" can run past 100.
+ *  - everything else walks *backward* from the oldest id, the usual scrollback.
+ *  - `around` centres a fixed window, so a second page has no coherent meaning
+ *    and it takes Discord's cap as-is.
+ *
+ * Discord hands back newest-first within a page, and forward paging makes the
+ * pages themselves ascend, so the result is sorted at the end rather than
+ * reversed — concatenation order isn't monotonic in both modes.
+ */
+export async function fetchMessages(query: HistoryQuery): Promise<BridgeMessage[]> {
+    const channel = toBridgeChannel(ChannelStore.getChannel(query.channelId));
+
+    const forward = Boolean(query.after);
+    const pageable = !query.around;
+
+    /**
+     * Discord discards `before` when `after` is also present — verified live: it
+     * returns messages well past the bound, with no error and no intersection of
+     * the two anchors. So the upper bound is enforced here instead of on the
+     * wire, which is also what makes "everything between A and B" work at all.
+     *
+     * Matching Discord's own convention, the bound is exclusive.
+     */
+    const upperBound = forward && query.before ? BigInt(query.before) : null;
+
+    const collected: any[] = [];
+    const seen = new Set<string>();
+    // Don't send a parameter the server is going to ignore.
+    let before = forward ? undefined : query.before;
+    let after = query.after;
+
+    // Pages are capped at MAX_PER_REQUEST, so this can only bite if the cursor
+    // stops advancing; it's a backstop against looping on a malformed response.
+    const maxPages = Math.ceil(query.limit / MAX_PER_REQUEST) + 1;
+
+    for (let page = 0; page < maxPages; page++) {
+        const remaining = query.limit - collected.length;
+        if (remaining <= 0) break;
+
+        const batch = await fetchPage({ ...query, limit: remaining, before, after });
+        if (!batch.length) break;
+
+        let passedBound = false;
+        for (const m of batch) {
+            const id = String(m?.id ?? "");
+            if (!id || seen.has(id)) continue;
+            if (upperBound !== null && BigInt(id) >= upperBound) {
+                passedBound = true;
+                continue;
+            }
+            seen.add(id);
+            collected.push(m);
+        }
+
+        // Walked past the far anchor, so the requested window is complete.
+        if (passedBound) break;
+
+        // A short page means we've reached the end of the channel in this direction.
+        if (batch.length < Math.min(remaining, MAX_PER_REQUEST)) break;
+        if (!pageable) break;
+
+        // Batches arrive newest-first: walk forward off the head, back off the tail.
+        const next = forward ? String(batch[0]?.id ?? "") : String(batch[batch.length - 1]?.id ?? "");
+        if (!next || next === (forward ? after : before)) break;
+        if (forward) after = next;
+        else before = next;
+    }
+
+    collected.sort((a, b) => snowflakeAsc(String(a?.id ?? "0"), String(b?.id ?? "0")));
+    return collected.map(m => toBridgeMessage(m, channel));
 }
 
 export interface SearchQuery {

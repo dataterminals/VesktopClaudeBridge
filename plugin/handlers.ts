@@ -47,9 +47,12 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
         let messages = cachedMessages(channel.id, limit);
         let fromCache = true;
 
-        // The cache holds only what has actually been rendered, so a channel the
-        // user just opened can come back nearly empty. Fall back to the API.
-        if (messages.length < Math.min(limit, 10)) {
+        // The cache holds only what has actually been rendered, and Discord caps
+        // it around 50 per channel, so anything larger than that can never be
+        // satisfied from memory. Refetch whenever it came up short rather than
+        // only when it's nearly empty — the old threshold silently handed back
+        // 50 messages to a caller that asked for 100.
+        if (messages.length < limit) {
             messages = await fetchMessages({ channelId: channel.id, limit });
             fromCache = false;
         }
@@ -156,7 +159,9 @@ export async function snapshotCurrentChannel() {
 
     const limit = clamp(settings.store.grabCount, 50);
     let messages = cachedMessages(channel.id, limit);
-    if (messages.length < Math.min(limit, 10)) {
+    // See the note in current_view: the cache tops out around 50, so a larger
+    // grabCount has to go to the API or the button quietly under-delivers.
+    if (messages.length < limit) {
         messages = await fetchMessages({ channelId: channel.id, limit });
     }
 

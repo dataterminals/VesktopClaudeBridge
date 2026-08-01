@@ -40,9 +40,25 @@ Results are rendered grouped by channel with full dates, unlike a transcript: a 
 
 The scope guard runs per hit rather than once up front, since results span channels and one out-of-scope channel shouldn't void the rest of the page. Hidden hits are counted in a footer rather than silently dropped.
 
+## Paging, and what Discord does with anchors
+
+`GET /channels/:id/messages` caps `limit` at 100 and **400s** above it rather than clamping, so anything larger has to be paged. `fetchMessages` walks forward off each batch's newest id when `after` is set — so "this message and everything after it" can exceed 100 — and backward off the oldest id otherwise.
+
+That makes concatenation non-monotonic: pages are newest-first internally, but forward paging makes successive pages ascend. Hence the result is sorted by snowflake at the end rather than reversed, and deduped, since page boundaries can overlap.
+
+Three behaviours were confirmed against a live client, not inferred:
+
+- **`after` is adjacent, not recent.** It returns the messages immediately following the anchor, so it means "start here and walk forward" rather than "the newest N that happen to be later". Anchoring at 17:44 with `limit=10` returned 17:52 → 18:02 while the channel's newest message was the next day.
+- **`before` is silently discarded when `after` is present.** No 400, no intersection of the two bounds — Discord just ignores the upper one and returns messages past it. So `after` + `before` is enforced client-side: the loop drops anything at or beyond the far anchor and stops as soon as it crosses. Without that, "read everything between A and B" quietly returns everything from A to the live edge. Measured: a 14-minute window returned 50 messages spanning nearly a day, 48 of them outside it.
+- **`around` isn't paged.** It centres a fixed window, so a second page has no coherent meaning; it takes Discord's cap as-is and returns fewer than asked without complaint.
+
+None of this is reachable from the sidecar's tests — the plugin half needs a live client. The smoke tests only pin that the sidecar delivers both anchors to the plugin, since dropping one on the way through would fail exactly as silently.
+
 ## Cache versus REST
 
-`current_view` reads `MessageStore` first because it's instant. But the cache only holds what has actually been rendered, so a channel the user just opened can come back nearly empty — if fewer than ~10 messages come back, it refetches over REST and flags `fromCache: false`.
+`current_view` reads `MessageStore` first because it's instant. But the cache only holds what has actually been rendered, and Discord caps it around 50 per channel — so it refetches over REST whenever the cache came up short of what was asked for, and flags `fromCache: false`.
+
+That threshold used to be "fewer than ~10 messages", which was wrong in a way that only showed up once someone raised `grabCount`: 50 cached messages clears a bar of 10, so a request for 100 was quietly answered with 50 and labelled `last 50`. Anything above the cache ceiling was dead config. Refetching whenever the cache is short costs an extra round trip on channels with less history than the limit, which is the right trade against silently under-delivering.
 
 History always goes to REST, through the client's own `RestAPI`. That's the same request the app makes when you scroll up: same session, same permissions, no bot token.
 

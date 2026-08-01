@@ -100,6 +100,8 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
     return new Promise((resolve, reject) => {
         const socket = new WebSocket(`ws://127.0.0.1:${WS_PORT}`, { origin });
         const closes = [];
+        // Params the sidecar actually put on the wire, per method.
+        const received = {};
 
         socket.on("open", () => {
             socket.send(JSON.stringify({
@@ -111,12 +113,15 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
         socket.on("message", raw => {
             const frame = JSON.parse(raw.toString());
 
-            if (frame.t === "hello-ok") return resolve({ socket, closes });
+            if (frame.t === "hello-ok") return resolve({ socket, closes, received });
 
             if (frame.t === "req") {
                 const answer = data => socket.send(JSON.stringify({ t: "res", id: frame.id, ok: true, data }));
+                received[frame.method] = frame.params;
 
                 switch (frame.method) {
+                    case "history":
+                        return answer({ channel: CHANNEL, messages: MESSAGES });
                     case "current_view":
                         return answer({
                             guild: GUILD, channel: CHANNEL, messages: MESSAGES,
@@ -225,7 +230,7 @@ try {
         }
     });
 
-    const { socket } = await fakePlugin();
+    const { socket, received } = await fakePlugin();
     check("good handshake connects", socket.readyState === WebSocket.OPEN);
 
     const status = await (await get("/status")).json();
@@ -252,6 +257,16 @@ try {
     const marked = await get("/marked");
     check("DM content is refused", marked.status === 403, `got ${marked.status}`);
     check("and names the setting", (await marked.text()).includes("denyDms"));
+
+    console.log("\nhistory anchors");
+    // Discord ignores `before` when `after` is present, so the plugin enforces the
+    // far bound itself. That enforcement can only be checked against a live client,
+    // but the sidecar dropping either anchor on the way through would break it just
+    // as silently — so pin that both actually reach the plugin.
+    await get("/history?channelId=2000&after=3000&before=3100&limit=50");
+    check("forwards `after` to the plugin", received.history?.after === "3000");
+    check("forwards `before` alongside it", received.history?.before === "3100");
+    check("does not silently drop one anchor", !!received.history?.after && !!received.history?.before);
 
     console.log("\nsearch");
     const search = await (await get("/search?guildId=1000&content=pak")).text();
