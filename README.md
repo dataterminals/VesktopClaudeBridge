@@ -24,16 +24,16 @@ The client already has all of this resolved in memory. This project just exposes
 ── #modding-help · The Forever Winter Modding · text
 ── 6 messages · 2026-08-01T14:31:02Z → 14:35:40Z · ids 1399482100000000000 → 1399482900000000000
 
-[14:31:02] Sylvia: did the pak actually load or is it silently failing again
+[14:31:02] Avery: did the pak actually load or is it silently failing again
 [14:32:40] Bob: silently failing
-   ↳ replying to Sylvia: "did the pak actually load or is it silently…"
+   ↳ replying to Avery: "did the pak actually load or is it silently…"
    [attachment] UE4SS.log · 43.2 KB · text/plain · msg 1399482400000000000
 [14:33:10] Bob:
 ```
 [2026.08.01-14.32.55:123][  0]LogUE4SS: Starting UE4SS
 [2026.08.01-14.32.55:481][  0]LogUE4SS: Error: mod folder not found
 ```
-[14:35:40] Sylvia: ah that's the -894 path thing (edited)
+[14:35:40] Avery: ah that's the -894 path thing (edited)
    👍 2
 ````
 

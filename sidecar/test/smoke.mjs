@@ -57,7 +57,7 @@ const user = (id, name) => ({ id, username: name, displayName: name, bot: false 
 
 const MESSAGES = [
     {
-        id: "3001", channelId: "2000", guildId: "1000", author: user("9001", "Sylvia"),
+        id: "3001", channelId: "2000", guildId: "1000", author: user("9001", "Avery"),
         timestamp: "2026-08-01T14:31:02.000Z", editedTimestamp: null,
         content: "did the pak actually load", replyTo: null,
         attachments: [], embeds: [], reactions: [], pinned: false,
@@ -68,7 +68,7 @@ const MESSAGES = [
         timestamp: "2026-08-01T14:32:40.000Z", editedTimestamp: null,
         // A fenced log, which is the whole reason this project exists.
         content: "nope:\n```\n[2026.08.01-14.32.55:123][  0]LogUE4SS: mod folder not found\n```",
-        replyTo: { id: "3001", author: "Sylvia", excerpt: "did the pak actually load", unresolved: false },
+        replyTo: { id: "3001", author: "Avery", excerpt: "did the pak actually load", unresolved: false },
         attachments: [{
             id: "4001", filename: "UE4SS.log", size: 44236, contentType: "text/plain",
             url: "https://cdn.discordapp.com/attachments/2000/4001/UE4SS.log", likelyText: true
@@ -88,7 +88,7 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
         socket.on("open", () => {
             socket.send(JSON.stringify({
                 t: "hello", protocol: 1, token,
-                user: user("9001", "Sylvia"), pluginVersion: "0.1.0-test"
+                user: user("9001", "Avery"), pluginVersion: "0.1.0-test"
             }));
         });
 
@@ -209,14 +209,14 @@ try {
 
     const status = await (await get("/status")).json();
     check("status reports connected", status.connected === true);
-    check("status reports the account", status.user?.displayName === "Sylvia");
+    check("status reports the account", status.user?.displayName === "Avery");
 
     console.log("\ntranscript");
     const view = await (await get("/current-view")).text();
     check("has a header", view.includes("#modding-help") && view.includes("Test Server"));
     check("has the id range for paging", view.includes("ids 3001 → 3002"));
-    check("renders a one-liner", view.includes("[14:31:02] Sylvia: did the pak actually load"));
-    check("shows the reply target", view.includes("↳ replying to Sylvia"));
+    check("renders a one-liner", view.includes("[14:31:02] Avery: did the pak actually load"));
+    check("shows the reply target", view.includes("↳ replying to Avery"));
     check("lists the attachment", view.includes("UE4SS.log") && view.includes("43.2 KB"));
     check("shows reactions", view.includes("👍 2"));
     check(
