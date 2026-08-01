@@ -289,6 +289,43 @@ try {
     check("forwards `before` alongside it", received.history?.before === "3100");
     check("does not silently drop one anchor", !!received.history?.after && !!received.history?.before);
 
+    console.log("\nrpc passthrough (how a second sidecar borrows this one)");
+    const rpcOk = await fetch(BASE + "/rpc", {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ method: "guilds", params: {} })
+    });
+    const rpcBody = await rpcOk.json();
+    check("proxies a call to the plugin", rpcBody.ok === true && rpcBody.data?.guilds?.[0]?.name === "Test Server");
+
+    const rpcBad = await fetch(BASE + "/rpc", {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ params: {} })
+    });
+    check("rejects a call with no method", rpcBad.status === 400);
+
+    const rpcNoAuth = await fetch(BASE + "/rpc", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ method: "guilds", params: {} })
+    });
+    // Same gate as everything else here - the passthrough is raw, so this matters more.
+    check("rpc is behind the token too", rpcNoAuth.status === 401);
+
+    const rpcErr = await fetch(BASE + "/rpc", {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        // Not in the fixture, so the fake plugin answers with an RpcError.
+        body: JSON.stringify({ method: "channels", params: { guildId: "1000" } })
+    });
+    const errBody = await rpcErr.json();
+    check(
+        "carries a plugin error back to the proxy",
+        errBody.ok === false && !!errBody.error?.code,
+        JSON.stringify(errBody).slice(0, 80)
+    );
+
     console.log("\nthird eye");
     const live = await (await get("/live")).text();
     check("names the watched channel", live.includes("#modding-help"));

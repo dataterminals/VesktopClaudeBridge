@@ -56,7 +56,21 @@ function secretsMatch(a: string, b: string): boolean {
     return timingSafeEqual(ha, hb);
 }
 
-export class BridgeServer extends EventEmitter {
+/**
+ * What the MCP tools and HTTP routes actually need from a bridge.
+ *
+ * Two things implement this: `BridgeServer`, which owns the plugin socket, and
+ * `RemoteBridge`, which borrows one from whichever process got there first. Only
+ * one process can hold the Discord connection, but several can want it — Claude
+ * Code and Claude Desktop each spawn their own sidecar.
+ */
+export interface Bridge {
+    status(): BridgeStatus;
+    call<M extends RpcMethod>(method: M, params: RpcParams[M]): Promise<RpcResults[M]>;
+    close(): Promise<void>;
+}
+
+export class BridgeServer extends EventEmitter implements Bridge {
     private wss: WebSocketServer | null = null;
     private socket: WebSocket | null = null;
     private pending = new Map<string, Pending>();

@@ -8,9 +8,19 @@ A Vencord plugin runs in Discord's renderer, which can't open a listening socket
 
 There's precedent: the `WebRichPresence (arRPC)` plugin connects out to a local process the same way, which is also useful evidence that Vesktop won't CSP-block the connection.
 
-## Why one sidecar process
+## Why one sidecar process, and how several coexist anyway
 
 The plugin holds the only authenticated view of Discord. Anything that wants that view has to share a connection to it, so the MCP server, the HTTP mirror and the bridge all live in one process rather than coordinating through a file or a second socket.
+
+That was fine until two MCP hosts wanted it at once. Claude Code spawns a sidecar per session and Claude Desktop spawns its own; the second one bound the same port, died with `EADDRINUSE`, and surfaced as `Connection closed` — which points nowhere near the cause.
+
+So the process now picks a role at startup. It asks over HTTP whether a sidecar already answers on the mirror port; if one does, it runs as a **client**, proxying every RPC through `/rpc` instead of hosting the bridge. Whoever started first keeps the Discord socket, everyone else borrows it, and the plugin still only ever holds one connection.
+
+Asking over HTTP rather than trying to bind is deliberate: a bind-and-release probe races anything starting at the same moment, and a successful `/status` also proves the owner is one of ours and shares our token.
+
+`/rpc` is a raw passthrough — unrendered, and it does not apply scope guards. That isn't a hole so much as where the guards already live: `assertAllowed` has always run at the rendering layer, in the MCP tools and HTTP routes, never in the bridge. A proxied call is guarded by its own consumer, reading the same config file as the owner. It is behind the same bearer token and the same loopback bind as everything else.
+
+A client-mode process with `--no-mcp` exits immediately, which is correct — it serves no HTTP and no MCP, so it has no job. In real use the stdio transport keeps it alive, and the status-refresh timer is `unref`'d so it never holds the process open past that.
 
 ## Output decisions
 

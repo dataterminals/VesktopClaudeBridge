@@ -13,11 +13,12 @@
  * of Discord, so everything that wants that view has to share a connection to it.
  */
 
-import { BridgeServer } from "./bridge-server.js";
+import { BridgeServer, type Bridge } from "./bridge-server.js";
 import { ensureConfigFile, loadConfig } from "./config.js";
 import { startHttpApi } from "./http-api.js";
 import { log, setLogLevel } from "./log.js";
 import { createMcpServer, serveMcpOverStdio } from "./mcp.js";
+import { RemoteBridge, findOwner } from "./remote-bridge.js";
 
 const VERSION = "0.1.0";
 
@@ -39,19 +40,37 @@ async function main() {
     log.info(`config: ${configPath}`);
     log.info(`downloads: ${cfg.downloadDir}`);
 
-    const bridge = new BridgeServer(cfg, VERSION);
-    await bridge.listen();
+    /*
+     * The plugin dials exactly one socket, so exactly one process can own it —
+     * but Claude Code and Claude Desktop each spawn their own sidecar. Whoever
+     * gets here first owns the Discord connection and serves everyone else;
+     * the rest proxy through it rather than dying on the port.
+     */
+    let bridge: Bridge;
+    let owner = false;
 
-    if (cfg.http) startHttpApi(bridge, cfg);
+    if (await findOwner(cfg)) {
+        const remote = new RemoteBridge(cfg);
+        await remote.attach();
+        bridge = remote;
+        log.info(`another sidecar owns the bridge on :${cfg.port}; proxying through :${cfg.httpPort}`);
+    } else {
+        const server = new BridgeServer(cfg, VERSION);
+        await server.listen();
+        bridge = server;
+        owner = true;
 
-    bridge.on("plugin-event", (event: string) => {
-        // Marks are pulled, not pushed — MCP has no way to wake the model up.
-        // This is just so `--log-level debug` shows you the user clicked.
-        log.debug(`plugin event: ${event}`);
-    });
+        if (cfg.http) startHttpApi(server, cfg);
+
+        server.on("plugin-event", (event: string) => {
+            // Marks are pulled, not pushed — MCP has no way to wake the model up.
+            // This is just so `--log-level debug` shows you the user clicked.
+            log.debug(`plugin event: ${event}`);
+        });
+    }
 
     if (args.has("--no-mcp")) {
-        log.info("running without MCP (bridge + http only)");
+        log.info(`running without MCP (${owner ? "bridge + http" : "proxy"} only)`);
     } else {
         const mcp = createMcpServer(bridge, cfg, VERSION);
         await serveMcpOverStdio(mcp);

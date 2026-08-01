@@ -16,7 +16,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import { fetchAttachment } from "./attachments.js";
-import { BridgeError, type BridgeServer } from "./bridge-server.js";
+import { BridgeError, type Bridge } from "./bridge-server.js";
 import type { Config } from "./config.js";
 import {
     Pseudonymizer,
@@ -27,7 +27,7 @@ import {
 } from "./format.js";
 import { log } from "./log.js";
 
-export function startHttpApi(bridge: BridgeServer, cfg: Config): Server {
+export function startHttpApi(bridge: Bridge, cfg: Config): Server {
     const pseudo = new Pseudonymizer(cfg.pseudonymize);
 
     const server = createServer((req, res) => {
@@ -73,6 +73,42 @@ export function startHttpApi(bridge: BridgeServer, cfg: Config): Server {
 
         if (!authorized(req)) {
             return send(res, 401, "unauthorized — send: Authorization: Bearer <token from `npm run token`>\n");
+        }
+
+        /*
+         * The transport for client mode: a raw passthrough to the plugin, so a
+         * second sidecar can borrow this one's Discord connection instead of
+         * dying on the port.
+         *
+         * Deliberately unrendered and unguarded — scope guards live at the
+         * rendering layer, and the caller is another sidecar that will apply
+         * them itself from the same config file. Token-gated and loopback-only
+         * like everything else here.
+         */
+        if (url.pathname === "/rpc" && req.method === "POST") {
+            const raw = await new Promise<string>(resolve => {
+                let buf = "";
+                req.on("data", c => (buf += c));
+                req.on("end", () => resolve(buf));
+            });
+            let parsed: any;
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                return sendJson(res, 400, { ok: false, error: { code: "bad_params", message: "body must be json" } });
+            }
+            if (!parsed?.method) {
+                return sendJson(res, 400, { ok: false, error: { code: "bad_params", message: "method is required" } });
+            }
+            try {
+                const data = await bridge.call(parsed.method, parsed.params ?? {});
+                return sendJson(res, 200, { ok: true, data });
+            } catch (err) {
+                if (err instanceof BridgeError) {
+                    return sendJson(res, 200, { ok: false, error: err.rpc });
+                }
+                throw err;
+            }
         }
 
         const wantJson = q.get("json") === "1";

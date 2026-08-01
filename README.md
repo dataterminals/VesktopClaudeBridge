@@ -107,7 +107,20 @@ claude mcp add discord -- node "D:/Github Repositories/VesktopClaudeBridge/sidec
 
 Check it took with `discord_status`. If it says `no_client`, Vesktop isn't running or the plugin isn't enabled.
 
-**Only one sidecar can run at a time.** It binds two loopback ports, so a second one exits immediately with `EADDRINUSE` — which Claude Code surfaces as the much less helpful `Failed to connect: Connection closed`. If you've got a sidecar running by hand (`npm start`), stop it before letting Claude Code spawn its own. The plugin reconnects on its own within ~15s of a sidecar appearing, so you don't need to reload Discord when sessions come and go.
+Start it by hand with `npm start` if you want one running independently — otherwise Claude Code spawns it for you when a session begins.
+
+**Several can run at once.** The plugin dials exactly one socket, so exactly one process owns the Discord connection — whoever starts first. Everyone after that detects the owner and proxies through it over `/rpc`, which is how Claude Code and Claude Desktop can both use this at the same time. The plugin reconnects on its own within ~15s of an owner appearing, so you don't need to reload Discord when sessions come and go.
+
+### Claude Desktop
+
+Same server, registered in `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{ "mcpServers": { "discord": { "command": "node",
+  "args": ["D:\\Github Repositories\\VesktopClaudeBridge\\sidecar\\dist\\index.js"] } } }
+```
+
+Browser claude.ai can't use this: it needs a *remote* MCP endpoint, and the whole security model here is loopback plus a token plus an `Origin` check — two of those three stop meaning anything the moment it's internet-reachable.
 
 If port 8787 is already taken on your machine, change it in **both** halves or the plugin will dial a socket nothing is listening on:
 

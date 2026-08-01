@@ -14,7 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { fetchAttachment } from "./attachments.js";
-import { BridgeError, type BridgeServer } from "./bridge-server.js";
+import { BridgeError, type Bridge } from "./bridge-server.js";
 import type { Config } from "./config.js";
 import {
     Pseudonymizer,
@@ -45,7 +45,7 @@ function failure(err: unknown): TextResult {
     return { content: [{ type: "text", text: `internal: ${message}` }], isError: true };
 }
 
-export function createMcpServer(bridge: BridgeServer, cfg: Config, version: string): McpServer {
+export function createMcpServer(bridge: Bridge, cfg: Config, version: string): McpServer {
     const server = new McpServer({ name: "vesktop-claude-bridge", version });
     const pseudo = new Pseudonymizer(cfg.pseudonymize);
 
