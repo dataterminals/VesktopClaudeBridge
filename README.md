@@ -55,6 +55,18 @@ The plugin **dials out** — renderers can't listen on a socket — and after th
 
 ## Install
 
+From a clone of this repo, this does every step below that doesn't need a mouse:
+
+```powershell
+.\scripts\bootstrap.ps1
+```
+
+It checks your tools are on `PATH` first (missing `pnpm` otherwise surfaces several minutes in, as an error about Equicord), builds the sidecar, clones Equicord beside this repo, installs the plugin and builds it. Then it prints the three things you have to carry into the GUI yourself: the token, the folder Vesktop wants, and the `claude mcp add` line with your path already filled in.
+
+`-EquicordPath D:\Equicord` puts the checkout somewhere specific; `-SkipEquicord` builds the sidecar alone. Re-running is safe — an existing Equicord checkout is reused as-is, never pulled or reset, for the reason in [Living with it](#living-with-it).
+
+The rest of this section is the same thing by hand, for when a step fails or you want to know what it touched.
+
 ### 1. Sidecar
 
 ```bash
