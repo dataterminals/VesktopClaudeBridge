@@ -14,6 +14,7 @@ import {
     listChannels,
     listGuilds,
     parseMessageLink,
+    searchMessages,
     selectedChannel,
     selectedGuild,
     toBridgeChannel,
@@ -74,6 +75,42 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
         return {
             channel: toBridgeChannel(ChannelStore.getChannel(params.channelId)),
             messages
+        };
+    },
+
+    async search(params: RpcParams["search"]): Promise<RpcResults["search"]> {
+        if (!params?.guildId && !params?.channelId) {
+            throw fail("bad_params", "search needs a guildId (or a channelId for a DM)");
+        }
+
+        // An unfiltered search matches every message in the server — nearly two
+        // million on a big one. That is never what the caller meant, and it
+        // costs a real API round trip to find out, so refuse it here.
+        const hasFilter = Boolean(params.content || params.authorId || params.mentions || params.has);
+        if (!hasFilter) {
+            throw fail("bad_params", "search needs at least one of: content, authorId, mentions, has");
+        }
+
+        const { hits, totalResults, indexing } = await searchMessages({
+            guildId: params.guildId,
+            channelId: params.channelId,
+            content: params.content,
+            authorId: params.authorId,
+            mentions: params.mentions,
+            has: params.has,
+            before: params.before,
+            after: params.after,
+            limit: clamp(params.limit, 25),
+            offset: Math.max(0, params.offset ?? 0),
+            sortOrder: params.sortOrder
+        });
+
+        return {
+            guild: params.guildId ? toBridgeGuild(GuildStore.getGuild(params.guildId)) : null,
+            totalResults,
+            hits,
+            offset: Math.max(0, params.offset ?? 0),
+            indexing
         };
     },
 

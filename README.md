@@ -114,6 +114,7 @@ If port 8787 is already taken on your machine, change it in **both** halves or t
 | `discord_marked` | the user right-clicked → **Mark for Claude**, or hit the chat-bar button |
 | `discord_fetch_attachment` | a log/crash dump/diff is attached; downloads it and previews the head |
 | `discord_resolve_link` | the user pasted a `discord.com/channels/...` link |
+| `discord_search` | "find where someone mentioned X" — you know roughly what was said, not where |
 | `discord_history` | paging back past what the client has cached |
 | `discord_guilds` / `discord_channels` | turning "the modding server" into an id |
 | `discord_status` | anything above returned `no_client` |
@@ -159,7 +160,7 @@ If a write path is ever added, it should be draft-into-composer: the model write
 ## Roadmap
 
 - [x] `current_view`, mark queue, history, link resolution, attachments
-- [ ] `discord_search` — guild search by author/text/date
+- [x] `discord_search` — guild search by text/author/mentions/attachment, with paging
 - [ ] `discord_threads` — forum channel listing and thread reads
 - [ ] Mark ranges (shift-click two messages) rather than a fixed context window
 - [ ] Draft-into-composer write path

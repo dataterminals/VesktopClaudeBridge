@@ -123,6 +123,20 @@ export interface CurrentView {
     fromCache: boolean;
 }
 
+/**
+ * One search result.
+ *
+ * Search spans channels, so unlike `history` a hit can't inherit its channel
+ * from the request — it carries its own.
+ */
+export interface SearchHit {
+    message: BridgeMessage;
+    channel: BridgeChannel | null;
+}
+
+/** What Discord's search endpoint accepts. `has` mirrors its filter vocabulary. */
+export type SearchHasFilter = "file" | "link" | "embed" | "image" | "sound" | "video" | "poll";
+
 export interface MarkedItem {
     /** Monotonic per-session id, so `marked.clear` can drop a single entry. */
     markId: number;
@@ -141,6 +155,7 @@ export type RpcMethod =
     | "ping"
     | "current_view"
     | "history"
+    | "search"
     | "resolve_link"
     | "marked.list"
     | "marked.clear"
@@ -157,6 +172,24 @@ export interface RpcParams {
         after?: string;
         around?: string;
     };
+    search: {
+        /** Guild to search. Omit only for a DM search, which needs `channelId`. */
+        guildId?: string;
+        /** Narrow a guild search to one channel, or name the DM to search. */
+        channelId?: string;
+        content?: string;
+        authorId?: string;
+        mentions?: string;
+        has?: SearchHasFilter;
+        /** Snowflake bounds, same ids as `history` uses. */
+        before?: string;
+        after?: string;
+        limit?: number;
+        /** Result offset, for paging past the first page. */
+        offset?: number;
+        /** Newest first by default. */
+        sortOrder?: "asc" | "desc";
+    };
     resolve_link: { url: string; context?: number; };
     "marked.list": { consume?: boolean; };
     "marked.clear": { markId?: number; };
@@ -168,6 +201,20 @@ export interface RpcResults {
     ping: { pong: true; user: BridgeUser | null; };
     current_view: CurrentView;
     history: { channel: BridgeChannel | null; messages: BridgeMessage[]; };
+    search: {
+        guild: BridgeGuild | null;
+        /** Total matches Discord claims, which is usually far more than `hits`. */
+        totalResults: number;
+        hits: SearchHit[];
+        /** Echoed back so the caller knows what to add to for the next page. */
+        offset: number;
+        /**
+         * Discord is still building this guild's search index, so results are
+         * incomplete. Worth saying out loud rather than reporting a short list
+         * as if it were the whole answer.
+         */
+        indexing: boolean;
+    };
     resolve_link: {
         guild: BridgeGuild | null;
         channel: BridgeChannel | null;

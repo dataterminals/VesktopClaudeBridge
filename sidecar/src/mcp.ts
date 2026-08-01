@@ -20,6 +20,7 @@ import {
     Pseudonymizer,
     assertAllowed,
     channelTypeName,
+    renderSearchResults,
     renderTranscript
 } from "./format.js";
 import { log } from "./log.js";
@@ -180,6 +181,102 @@ export function createMcpServer(bridge: BridgeServer, cfg: Config, version: stri
                 });
                 assertAllowed(cfg, res.channel);
                 return text(transcript(null, res.channel, res.messages, ids));
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_search",
+        {
+            title: "Search a server's messages",
+            description:
+                "Search a Discord server through Discord's own search index. This is the right tool for 'find where someone mentioned X', 'did anyone post about Y', or 'what did Z say about this' — anything where you know roughly what was said but not when or in which channel. Do NOT page discord_history backwards to look for something; that reads a channel in order and will run out of context long before it reaches an old message. Needs at least one of content/authorId/mentions/has. Results carry no reactions and usually no reply body (Discord's search payloads omit them) — read a hit with discord_history around=<id> to see it in full context.",
+            inputSchema: {
+                guildId: z
+                    .string()
+                    .optional()
+                    .describe("Server to search, from discord_guilds. Required unless searching a DM."),
+                channelId: z
+                    .string()
+                    .optional()
+                    .describe("Narrow a guild search to one channel, or name the DM channel to search."),
+                content: z.string().optional().describe("Text to look for. Discord matches whole words, not substrings."),
+                authorId: z.string().optional().describe("Only messages by this user id."),
+                mentions: z.string().optional().describe("Only messages mentioning this user id."),
+                has: z
+                    .enum(["file", "link", "embed", "image", "sound", "video", "poll"])
+                    .optional()
+                    .describe("Only messages carrying this kind of thing. `file` is the one you want for logs and crash dumps."),
+                before: z.string().optional().describe("Only messages older than this message id."),
+                after: z.string().optional().describe("Only messages newer than this message id."),
+                limit: z.number().int().optional().describe("Hits per page (default 25)."),
+                offset: z.number().int().optional().describe("Skip this many hits, for paging. The tool tells you the next offset."),
+                sortOrder: z
+                    .enum(["asc", "desc"])
+                    .optional()
+                    .describe("Oldest or newest first. Defaults to newest first."),
+                ids: z.boolean().optional().describe("Tag every hit with its id. On by default here — a hit you can't jump to isn't much use.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ guildId, channelId, content, authorId, mentions, has, before, after, limit, offset, sortOrder, ids }): Promise<TextResult> => {
+            try {
+                if (guildId && cfg.allowGuilds.length && !cfg.allowGuilds.includes(guildId)) {
+                    return failure(
+                        new BridgeError({ code: "forbidden", message: `Guild ${guildId} is not allowlisted.` })
+                    );
+                }
+                // A search with no guild is a DM search, which the DM guard owns.
+                if (!guildId && cfg.denyDms) {
+                    return failure(
+                        new BridgeError({
+                            code: "forbidden",
+                            message:
+                                "Searching without a guildId means searching DMs, which are disabled. Pass a guildId, or set \"denyDms\": false in the sidecar config."
+                        })
+                    );
+                }
+
+                const res = await bridge.call("search", {
+                    guildId,
+                    channelId,
+                    content,
+                    authorId,
+                    mentions,
+                    has,
+                    before,
+                    after,
+                    limit: clamp(limit ?? 25),
+                    offset: offset ?? 0,
+                    sortOrder
+                });
+
+                // Hits span channels, so the scope guard runs per hit rather than
+                // once up front — one out-of-scope channel shouldn't void the rest.
+                const allowed = res.hits.filter(h => {
+                    try {
+                        assertAllowed(cfg, h.channel);
+                        return true;
+                    } catch {
+                        return false;
+                    }
+                });
+                const dropped = res.hits.length - allowed.length;
+
+                const body = renderSearchResults(
+                    {
+                        guild: res.guild,
+                        hits: allowed.map(h => ({ ...h, message: pseudo.apply([h.message])[0]! })),
+                        totalResults: res.totalResults,
+                        offset: res.offset,
+                        indexing: res.indexing
+                    },
+                    { truncateAt: cfg.truncateAt, ids: ids ?? true }
+                );
+                const note = dropped ? `\n\n(${dropped} hit(s) hidden by the sidecar's scope config)` : "";
+                return text(body + note);
             } catch (err) {
                 return failure(err);
             }

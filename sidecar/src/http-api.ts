@@ -18,7 +18,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { fetchAttachment } from "./attachments.js";
 import { BridgeError, type BridgeServer } from "./bridge-server.js";
 import type { Config } from "./config.js";
-import { Pseudonymizer, assertAllowed, renderTranscript } from "./format.js";
+import { Pseudonymizer, assertAllowed, renderSearchResults, renderTranscript } from "./format.js";
 import { log } from "./log.js";
 
 export function startHttpApi(bridge: BridgeServer, cfg: Config): Server {
@@ -129,6 +129,61 @@ export function startHttpApi(bridge: BridgeServer, cfg: Config): Server {
                     return wantJson
                         ? sendJson(res, 200, out)
                         : send(res, 200, render(null, out.channel, out.messages) + "\n");
+                }
+
+                case "/search": {
+                    const guildId = q.get("guildId") ?? undefined;
+                    const channelId = q.get("channelId") ?? undefined;
+                    if (guildId && cfg.allowGuilds.length && !cfg.allowGuilds.includes(guildId)) {
+                        return send(res, 403, `forbidden: guild ${guildId} is not allowlisted\n`);
+                    }
+                    if (!guildId && cfg.denyDms) {
+                        return send(
+                            res,
+                            403,
+                            "forbidden: searching without a guildId searches DMs, which are disabled. Pass guildId, or set \"denyDms\": false in the sidecar config.\n"
+                        );
+                    }
+
+                    const out = await bridge.call("search", {
+                        guildId,
+                        channelId,
+                        content: q.get("content") ?? undefined,
+                        authorId: q.get("authorId") ?? undefined,
+                        mentions: q.get("mentions") ?? undefined,
+                        has: (q.get("has") as any) ?? undefined,
+                        before: q.get("before") ?? undefined,
+                        after: q.get("after") ?? undefined,
+                        limit: Math.max(1, Math.min(limit ?? 25, cfg.maxLimit)),
+                        offset: q.has("offset") ? Number.parseInt(q.get("offset")!, 10) : 0,
+                        sortOrder: (q.get("sortOrder") as "asc" | "desc" | null) ?? undefined
+                    });
+
+                    const allowed = out.hits.filter(h => {
+                        try {
+                            assertAllowed(cfg, h.channel);
+                            return true;
+                        } catch {
+                            return false;
+                        }
+                    });
+
+                    return wantJson
+                        ? sendJson(res, 200, { ...out, hits: allowed })
+                        : send(
+                              res,
+                              200,
+                              renderSearchResults(
+                                  {
+                                      guild: out.guild,
+                                      hits: allowed.map(h => ({ ...h, message: pseudo.apply([h.message])[0]! })),
+                                      totalResults: out.totalResults,
+                                      offset: out.offset,
+                                      indexing: out.indexing
+                                  },
+                                  { truncateAt: cfg.truncateAt, ids: q.get("ids") !== "0" }
+                              ) + "\n"
+                          );
                 }
 
                 case "/resolve": {

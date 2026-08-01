@@ -16,7 +16,7 @@
 
 import type { Config } from "./config.js";
 import { BridgeError } from "./bridge-server.js";
-import type { BridgeChannel, BridgeGuild, BridgeMessage } from "./protocol.js";
+import type { BridgeChannel, BridgeGuild, BridgeMessage, SearchHit } from "./protocol.js";
 
 const CHANNEL_TYPES: Record<number, string> = {
     0: "text",
@@ -121,10 +121,22 @@ export interface CompactOptions {
     truncateAt: number;
     /** Emit a `⟨id⟩` marker on every message, not just in the header. */
     ids?: boolean;
+    /**
+     * Transcripts are one channel over minutes, so the date in the header is
+     * enough and every line can be a bare clock time. Search results are the
+     * opposite — scattered across channels and often years — so they carry the
+     * date on every line.
+     */
+    stamp?: "time" | "datetime";
 }
 
 function hhmmss(iso: string): string {
     return iso.length >= 19 ? iso.slice(11, 19) : iso;
+}
+
+function stampFor(iso: string, mode: CompactOptions["stamp"]): string {
+    if (mode !== "datetime") return hhmmss(iso);
+    return iso.length >= 19 ? `${iso.slice(0, 10)} ${iso.slice(11, 19)}` : iso;
 }
 
 function humanSize(bytes: number): string {
@@ -204,7 +216,7 @@ export function compactMessages(messages: BridgeMessage[], opts: CompactOptions)
 
         const name = m.author.displayName + (m.author.bot ? " [bot]" : "");
         const body = truncate(m.content, opts.truncateAt);
-        const stamp = hhmmss(m.timestamp);
+        const stamp = stampFor(m.timestamp, opts.stamp);
 
         if (body.includes("\n")) {
             // Header line, then the body verbatim on its own lines. No indent —
@@ -231,4 +243,66 @@ export function renderTranscript(
     const header = compactHeader(guild, channel, messages);
     if (messages.length === 0) return header;
     return `${header}\n\n${compactMessages(messages, opts)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Search results
+// ---------------------------------------------------------------------------
+
+export interface SearchRenderInput {
+    guild: BridgeGuild | null;
+    hits: SearchHit[];
+    totalResults: number;
+    offset: number;
+    indexing: boolean;
+}
+
+/**
+ * Renders search hits grouped by channel.
+ *
+ * A transcript is one conversation in order; search results are a scattered
+ * set, so they get a different shape. Grouping by channel keeps related hits
+ * together and says where each one lives, and every hit keeps its id, because
+ * the only useful next step from a search result is to go and read around it.
+ */
+export function renderSearchResults(input: SearchRenderInput, opts: CompactOptions): string {
+    const { guild, hits, totalResults, offset, indexing } = input;
+
+    const scope = guild ? ` · ${guild.name}` : "";
+    const shown = hits.length
+        ? `showing ${offset + 1}-${offset + hits.length} of ${totalResults}`
+        : `${totalResults} matches`;
+    const lines = [`── search${scope} · ${shown}`];
+
+    if (indexing) {
+        lines.push("── Discord is still building this server's search index; results may be incomplete.");
+    }
+
+    if (!hits.length) {
+        lines.push("── no matches");
+        return lines.join("\n");
+    }
+
+    // Preserve Discord's ordering of the hits themselves; only cluster runs of
+    // the same channel so the reader isn't re-reading the channel name.
+    const groups: { channel: BridgeChannel | null; messages: BridgeMessage[]; }[] = [];
+    for (const hit of hits) {
+        const last = groups[groups.length - 1];
+        if (last && last.channel?.id === hit.channel?.id) last.messages.push(hit.message);
+        else groups.push({ channel: hit.channel, messages: [hit.message] });
+    }
+
+    const blocks = groups.map(g => {
+        const where = g.channel
+            ? `${g.channel.isDm ? "" : "#"}${g.channel.name}${g.channel.isThread ? " (thread)" : ""} · ${channelTypeName(g.channel.type)}`
+            : "(unknown channel)";
+        return `── ${where}\n${compactMessages(g.messages, { ...opts, stamp: "datetime" })}`;
+    });
+
+    const more =
+        offset + hits.length < totalResults
+            ? `\n\n(more matches — repeat with offset=${offset + hits.length})`
+            : "";
+
+    return `${lines.join("\n")}\n\n${blocks.join("\n\n")}${more}`;
 }

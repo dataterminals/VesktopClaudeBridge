@@ -330,6 +330,104 @@ export async function fetchMessages(query: HistoryQuery): Promise<BridgeMessage[
     return body.reverse().map(m => toBridgeMessage(m, channel));
 }
 
+export interface SearchQuery {
+    guildId?: string;
+    channelId?: string;
+    content?: string;
+    authorId?: string;
+    mentions?: string;
+    has?: string;
+    before?: string;
+    after?: string;
+    limit: number;
+    offset: number;
+    sortOrder?: "asc" | "desc";
+}
+
+/**
+ * Discord's own search index, which is the only sane way to answer "where did
+ * someone mention this" — paging back through `history` is O(the whole channel).
+ *
+ * Two things about this endpoint are not obvious and both were confirmed
+ * against a live client rather than inferred:
+ *
+ *  - `SEARCH_CHANNEL` is for DMs only. Point it at a guild text channel and it
+ *    returns 400 `Cannot execute action on this channel type` (50024). To scope
+ *    a guild search to one channel you pass `channel_id` to `SEARCH_GUILD`.
+ *  - `body.messages` is an array *of arrays*. Each group is a hit plus optional
+ *    surrounding context, and the hit itself is flagged `hit: true`.
+ *
+ * Search payloads also carry no `reactions` and no `referenced_message`, so
+ * those degrade to empty/unresolved unless the cache happens to have the
+ * message. That's honest rather than wrong, but it's why a hit can look
+ * thinner than the same message read through `history`.
+ */
+export async function searchMessages(query: SearchQuery): Promise<{
+    hits: { message: BridgeMessage; channel: BridgeChannel | null; }[];
+    totalResults: number;
+    indexing: boolean;
+}> {
+    const params: Record<string, string | number> = {
+        limit: query.limit,
+        offset: query.offset
+    };
+    if (query.content) params.content = query.content;
+    if (query.authorId) params.author_id = query.authorId;
+    if (query.mentions) params.mentions = query.mentions;
+    if (query.has) params.has = query.has;
+    // Discord bounds by snowflake, not date; `before`/`after` are message ids.
+    if (query.before) params.max_id = query.before;
+    if (query.after) params.min_id = query.after;
+    if (query.sortOrder) {
+        params.sort_by = "timestamp";
+        params.sort_order = query.sortOrder;
+    }
+
+    const url = query.guildId
+        ? Constants.Endpoints.SEARCH_GUILD(query.guildId)
+        : Constants.Endpoints.SEARCH_CHANNEL(query.channelId!);
+
+    // Only meaningful for a guild search; a DM search is already scoped.
+    if (query.guildId && query.channelId) params.channel_id = query.channelId;
+
+    let response: any;
+    try {
+        response = await RestAPI.get({ url, query: params, retries: 1 });
+    } catch (err: any) {
+        const status = err?.status;
+        const code = err?.body?.code;
+        if (code === 50024) {
+            throw fail(
+                "bad_params",
+                "Discord refused to search that channel directly. Pass guildId (optionally with channelId) for guild channels — channel-only search is for DMs."
+            );
+        }
+        throw fail(
+            status === 403 ? "forbidden" : "discord_error",
+            status === 403
+                ? "No permission to search there."
+                : `Discord rejected the search (${status ?? "unknown"}${code ? `, code ${code}` : ""}).`
+        );
+    }
+
+    const body = response?.body ?? {};
+
+    // 202 means the index is still being built; Discord returns no messages yet.
+    const indexing = response?.status === 202 || Boolean(body.doing_deep_historical_index);
+
+    const groups: any[] = Array.isArray(body.messages) ? body.messages : [];
+    const hits = groups
+        .map(group => (Array.isArray(group) ? (group.find((m: any) => m?.hit) ?? group[0]) : group))
+        .filter(Boolean)
+        .map(raw => {
+            // Results span channels, so each hit resolves its own.
+            const channel = toBridgeChannel(ChannelStore.getChannel(String(raw.channel_id)));
+            return { message: toBridgeMessage(raw, channel), channel };
+        });
+
+    return { hits, totalResults: Number(body.total_results ?? hits.length), indexing };
+}
+
 export function listGuilds(): BridgeGuild[] {
     const guilds: Record<string, any> = GuildStore.getGuilds() ?? {};
     return Object.values(guilds)

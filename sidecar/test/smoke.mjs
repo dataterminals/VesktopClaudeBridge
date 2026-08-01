@@ -51,6 +51,8 @@ const CHANNEL = {
 
 const DM_CHANNEL = { ...CHANNEL, id: "2999", name: "dm:bob", type: 1, guildId: null, isDm: true };
 
+const OTHER_CHANNEL = { ...CHANNEL, id: "2001", name: "tech-support" };
+
 const GUILD = { id: "1000", name: "Test Server" };
 
 const user = (id, name) => ({ id, username: name, displayName: name, bot: false });
@@ -75,6 +77,20 @@ const MESSAGES = [
         }],
         embeds: [], reactions: [{ emoji: "👍", count: 2, me: false }], pinned: false,
         link: "https://discord.com/channels/1000/2000/3002"
+    }
+];
+
+// Search hits are scattered rather than contiguous: two channels, years apart,
+// and a total far larger than the page, so paging and grouping both get tested.
+const SEARCH_HITS = [
+    { message: MESSAGES[1], channel: CHANNEL },
+    {
+        message: {
+            ...MESSAGES[0], id: "3500", channelId: "2001",
+            timestamp: "2024-02-11T09:18:05.000Z",
+            content: "old mention of the pak loader"
+        },
+        channel: OTHER_CHANNEL
     }
 ];
 
@@ -113,6 +129,11 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
                         }] });
                     case "guilds":
                         return answer({ guilds: [GUILD] });
+                    case "search":
+                        return answer({
+                            guild: GUILD, totalResults: 385, hits: SEARCH_HITS,
+                            offset: frame.params?.offset ?? 0, indexing: false
+                        });
                     default:
                         return socket.send(JSON.stringify({
                             t: "res", id: frame.id, ok: false,
@@ -231,6 +252,27 @@ try {
     const marked = await get("/marked");
     check("DM content is refused", marked.status === 403, `got ${marked.status}`);
     check("and names the setting", (await marked.text()).includes("denyDms"));
+
+    console.log("\nsearch");
+    const search = await (await get("/search?guildId=1000&content=pak")).text();
+    check("reports the match count", search.includes("of 385"));
+    check("groups hits under their channel", search.includes("── #modding-help") && search.includes("── #tech-support"));
+    check(
+        "stamps hits with the date, not just a clock",
+        search.includes("[2024-02-11 09:18:05]"),
+        "search spans years, so a bare time is ambiguous"
+    );
+    check("keeps ids so a hit can be followed up", search.includes("⟨3500⟩"));
+    check("says how to get the next page", search.includes("offset=2"));
+    check("code fence still survives", search.includes("\n```\n[2026.08.01-14.32.55:123][  0]LogUE4SS: mod folder not found\n```"));
+
+    const dmSearch = await get("/search?content=pak");
+    check("searching without a guild hits the DM guard", dmSearch.status === 403, `got ${dmSearch.status}`);
+    check("and names the setting", (await dmSearch.text()).includes("denyDms"));
+
+    const searchJson = await (await get("/search?guildId=1000&content=pak&json=1")).json();
+    check("json mode returns hits with their channels", searchJson.hits?.[1]?.channel?.name === "tech-support");
+    check("json mode carries the total", searchJson.totalResults === 385);
 
     console.log("\njson mode");
     const json = await (await get("/current-view?json=1")).json();

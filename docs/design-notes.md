@@ -24,6 +24,22 @@ The plugin holds the only authenticated view of Discord. Anything that wants tha
 
 **Truncation is recoverable.** Long bodies get cut with a note naming the tool and argument that would fetch the rest, rather than silently ending.
 
+## Search
+
+`history` reads a channel in order; `search` asks Discord's index a question. Paging `history` backwards to find an old message is O(the whole channel) and runs out of context long before it arrives, which is why this exists.
+
+Three things about the endpoint were confirmed against a live client rather than inferred, because all three are the kind of thing that looks fine until it isn't:
+
+- **`SEARCH_CHANNEL` is for DMs only.** Point it at a guild text channel and Discord returns 400 `Cannot execute action on this channel type` (code 50024). Scoping a guild search to one channel means passing `channel_id` to `SEARCH_GUILD`. The plugin maps 50024 to a message that says this, because the raw error points nowhere useful.
+- **`body.messages` is an array of arrays.** Each group is a hit plus optional context, and the hit carries `hit: true`. Reading `messages[i]` as a message gets you an array.
+- **An unfiltered search matches everything.** No `content`/`author_id`/`mentions`/`has` returned ~1.9M results on a mid-sized server. The handler refuses that before spending a round trip, since it is never what the caller meant.
+
+Search payloads carry no `reactions` and no `referenced_message`, so hits render thinner than the same message read through `history` — reactions vanish and replies show as unresolved unless the cache happens to hold the target. That's honest rather than wrong, and the tool description says to re-read a hit with `history around=<id>` when the context matters.
+
+Results are rendered grouped by channel with full dates, unlike a transcript: a transcript is one conversation over minutes, where the header carries the date and every line can be a bare clock time. Search results are scattered across channels and often years, so they carry the date on every line and keep their ids — the only useful next step from a hit is to go read around it.
+
+The scope guard runs per hit rather than once up front, since results span channels and one out-of-scope channel shouldn't void the rest of the page. Hidden hits are counted in a footer rather than silently dropped.
+
 ## Cache versus REST
 
 `current_view` reads `MessageStore` first because it's instant. But the cache only holds what has actually been rendered, so a channel the user just opened can come back nearly empty — if fewer than ~10 messages come back, it refetches over REST and flags `fromCache: false`.
@@ -90,7 +106,7 @@ cd <equicord> && npx tsc --noEmit
 - **Marks are pulled, never pushed.** MCP gives a server no way to wake a model up, so marking something doesn't notify anyone — it sits in the queue until a tool call asks. The plugin does emit a `marked` event over the socket, but nothing acts on it yet.
 - **`markContext` is a fixed window**, not a range. Marking two ends of a conversation takes two marks.
 - **Forum channels** appear in `discord_channels` but their threads don't; `discord_threads` isn't built yet.
-- **No search.** Discord's search endpoint is the obvious next addition and the highest-value one — scrolling back through months of history via `before` is the wrong tool for "find where someone mentioned this".
+- **Search can't see threads.** `SEARCH_GUILD` indexes channel messages; forum posts and thread replies don't reliably come back, which is the same gap `discord_threads` would close.
 - **Attachment urls expire.** `discord_fetch_attachment` re-reads the message to mint a fresh signature rather than trusting a url from an earlier tool result. Don't cache them.
 - **Unresolved replies aren't retried.** Discord's REST doesn't always inline `referenced_message`, so `discord_history` can render `replying to someone (body not loaded)` for a message that is still perfectly fetchable — confirmed live: a reply target that came back unresolved was readable via `around=<id>` a moment later. `current_view` doesn't show this because the cache has the body. Fixing it means either a second fetch per unresolved reply or resolving against the page already in hand, which only helps when the target is in the same window. Left alone for now because the flag is honest about what happened, but it's the cheapest remaining win in transcript quality.
 - **One sidecar per machine.** It binds two loopback ports and exits on `EADDRINUSE`, so a hand-started sidecar and a Claude-Code-spawned one can't coexist. The failure surfaces as `Connection closed`, which doesn't point anywhere near the real cause.
