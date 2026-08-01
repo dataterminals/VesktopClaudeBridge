@@ -85,11 +85,19 @@ Then point Vesktop at **`D:\Equicord\dist\equibop`** (Vesktop settings → *Venc
 
 `dist\equibop`, not `dist` and not `dist\desktop`. Vesktop `require()`s the Vencord main from that folder, and the two builds are not interchangeable: `dist\desktop\patcher.js` is the Discord `app.asar` injector and pulls in `discord_desktop_core`. Hand Vesktop that one and it hangs on the splash screen with no error in any log. Equibop is Equicord's Vesktop fork, so `dist\equibop` is the "host app loads Vencord" build.
 
-Vesktop also validates the folder against Vencord's *release asset* names (`vencordDesktopMain.js` and friends), which Equicord doesn't build — so a stock Equicord dist is rejected as "invalid". `-Build` writes those four names in beside the real ones for you. They're copies of build output, so re-run the script after every Equicord rebuild rather than aliasing once by hand.
+Vesktop also validates the folder against Vencord's *release asset* names (`vencordDesktopMain.js` and friends), which Equicord doesn't build — so a stock Equicord dist is rejected as "invalid". `-Build` writes those four names in beside the real ones for you. They're copies of build output rather than links, which is why rebuilding has to go through the script — see [Living with it](#living-with-it).
 
 The token box clears itself on reload — that's intentional. Vencord's cloud settings sync uploads the settings blob to a remote host, so the plugin moves the token into `localStorage` instead, where it stays on this machine.
 
 One surprise worth knowing: once Vesktop is loading Equicord from a custom *Vencord Location*, Equicord keeps its settings in **`%APPDATA%\Equicord\settings`**, not `%APPDATA%\vesktop\settings`. That folder is empty until you do this, which makes it easy to spend a while editing a file nothing reads.
+
+Which also means an existing Vencord setup does not come with you — Equicord starts from defaults, and the old config sits there looking current. Moving it over is mostly a copy, with three snags:
+
+- **`quickCss.css` and `themes/`** just copy across, but `useQuickCss` lives in `settings.json` and has to come too or the CSS loads and does nothing.
+- **Some plugins are renamed.** `VencordToolbox` is `EquicordToolbox` (that's the toolbar QuickCSS toggle, under *Themes* in its menu), and `petpet` is `PetPet`. Same plugin bank otherwise — Equicord is a Vencord superset, so most names match exactly.
+- **Don't copy the `cloud` block.** It points at Vencord's cloud host with sync on; Equicord has its own. Carrying it over turns settings sync back on against a different service.
+
+Required plugins (`BadgeAPI`, `NoticesAPI`, `ContextMenuAPI`, `SupportHelper`) don't need migrating — Vencord manages those itself.
 
 ### 3. Wire up MCP
 
@@ -105,6 +113,37 @@ If port 8787 is already taken on your machine, change it in **both** halves or t
 
 - `%APPDATA%\vesktop-claude-bridge\config.json` → `port` (the HTTP mirror defaults to `port + 1`)
 - the plugin's **Port** setting in Equicord settings
+
+## Living with it
+
+Once this is set up, Vesktop stops using the Vencord it downloads for itself and loads your Equicord build off disk instead. You still launch Vesktop the same way — nothing about the shortcut changes — but the chain underneath is now:
+
+```
+vesktop.exe
+  └─ reads vencordDir from %APPDATA%\vesktop\state.json
+       → D:\Equicord\dist\equibop
+         ├─ require()s vencordDesktopMain.js   (main process)
+         └─ injects  vencordDesktopPreload.js + vencordDesktopRenderer.js
+              └─ Equicord reads its settings from %APPDATA%\Equicord\settings
+```
+
+Three things follow from that, and all three fail quietly rather than loudly:
+
+**The Equicord checkout is a runtime dependency, not a build artifact.** Vesktop reads it on every launch, so it can't be cleaned up or moved. If those files go missing, Vesktop doesn't error — `ensureVencordFiles()` downloads *stock Vencord release files into `dist\equibop`*, leaving a half-Vencord-half-Equicord folder that behaves strangely rather than failing.
+
+**Never run a bare `pnpm build` in the Equicord checkout.** The four `vencordDesktop*` files Vesktop loads are *copies*, not links. esbuild rewrites `main.js` and `renderer.js` and leaves the copies alone, so Vesktop silently keeps loading your previous build — no error anywhere, and the change you just made simply isn't there. Always rebuild through the script:
+
+```powershell
+.\scripts\install-plugin.ps1 -EquicordPath D:\Equicord -Build
+```
+
+**Run that same command after every `git pull` in Equicord.** The plugin lives *inside* the Equicord tree at `src/userplugins/vesktopClaudeBridge`, so an update needs it re-copied and the aliases regenerated. This is the standing cost of userplugins; it's one command, but forgetting it looks like "my change didn't do anything" rather than like an error.
+
+### Getting back out
+
+Clear *Vencord Location* in Vesktop settings and it reverts to the Vencord it manages itself, with the config in `%APPDATA%\vesktop\settings`. Both are left untouched by any of this, so that's a clean escape hatch if an Equicord update ever breaks something mid-conversation.
+
+Note that the two configs are separate stores, not one shared one — changes you make under Equicord don't appear in the Vesktop-managed Vencord, and vice versa.
 
 ## Tools
 
