@@ -114,6 +114,25 @@ If port 8787 is already taken on your machine, change it in **both** halves or t
 - `%APPDATA%\vesktop-claude-bridge\config.json` → `port` (the HTTP mirror defaults to `port + 1`)
 - the plugin's **Port** setting in Equicord settings
 
+## Third eye
+
+Toggle it from the chat-bar button (it opens a menu — mark, or watch) and it quietly buffers the channel you're in. Nothing reads that buffer until you ask, or until you next send Claude a message.
+
+Capture costs nothing at all — no model, no tokens, no session — so it's fine to leave armed. Reading is the only part that spends anything, which is why the icon's burst only lights while a drain is happening: you can tell at a glance whether it's just watching or actually being read.
+
+Set **Third eye terms** in the plugin settings to a comma-separated list of things you care about — a repo name, a mod name, a build number. Mentions and replies are caught automatically, but conversations *about* your work usually never name you, and that's the case the term list exists for.
+
+Watches lapse after four hours and say so. Turning Discord off and on again keeps the watch but drops anything unread, because message bodies are never written to disk.
+
+For the button alone to be enough, register the hook — otherwise you'd have to tell Claude the watch is running once per session:
+
+```json
+{ "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command",
+  "command": "node \"<repo>/scripts/third-eye-hook.mjs\"" } ] } ] } }
+```
+
+It runs on every message you send, times out after 2s, exits 0 on every failure path, and prints nothing when there's nothing to say.
+
 ## Living with it
 
 Once this is set up, Vesktop stops using the Vencord it downloads for itself and loads your Equicord build off disk instead. You still launch Vesktop the same way — nothing about the shortcut changes — but the chain underneath is now:
@@ -151,6 +170,7 @@ Note that the two configs are separate stores, not one shared one — changes yo
 | --- | --- |
 | `discord_current_view` | "read the logs" with no other detail — reads whatever channel is on screen |
 | `discord_marked` | the user right-clicked → **Mark for Claude**, or hit the chat-bar button |
+| `discord_live` | third eye is on and they're asking what's been happening while they worked |
 | `discord_fetch_attachment` | a log/crash dump/diff is attached; downloads it and previews the head |
 | `discord_resolve_link` | the user pasted a `discord.com/channels/...` link |
 | `discord_search` | "find where someone mentioned X" — you know roughly what was said, not where |
@@ -200,6 +220,7 @@ If a write path is ever added, it should be draft-into-composer: the model write
 
 - [x] `current_view`, mark queue, history, link resolution, attachments
 - [x] `discord_search` — guild search by text/author/mentions/attachment, with paging
+- [x] Third eye — watch a channel in the background, read it back on demand
 - [ ] `discord_threads` — forum channel listing and thread reads
 - [ ] Mark ranges (shift-click two messages) rather than a fixed context window
 - [ ] Draft-into-composer write path

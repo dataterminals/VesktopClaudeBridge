@@ -54,6 +54,28 @@ Three behaviours were confirmed against a live client, not inferred:
 
 None of this is reachable from the sidecar's tests — the plugin half needs a live client. The smoke tests only pin that the sidecar delivers both anchors to the plugin, since dropping one on the way through would fail exactly as silently.
 
+## Third eye
+
+A watcher on one channel, toggled from the chat-bar menu. The buffer lives in the plugin rather than the sidecar, which is the whole architectural bet: Claude Code spawns the sidecar per session and kills it on exit, so a sidecar-side buffer would evaporate exactly when you walked away — which is when you wanted it. Discord runs all day.
+
+Three things follow. Denied content never crosses the process boundary, so `denyDms` means "never left the renderer" rather than "refused on arrival". The drain is a pull like `marked.list`, so sidecar restarts cost nothing. And the sidecar's added state is small enough to need no new config keys.
+
+**Capture is free; reading is the only part that costs.** No model, no tokens, no session is involved in filling the buffer, so it keeps everything and the filtering happens at the boundary where tokens would actually be spent. Measured on a real channel: 100 messages renders to ~3,900 tokens, so a `notableOnly` read is roughly 15× cheaper than draining the window. That ratio is what makes leaving it armed all day free in practice rather than only in theory.
+
+Verified against a live client on 2026-08-01, none of which source-reading could establish:
+
+- `MESSAGE_CREATE`'s payload really is the REST shape, so `toBridgeMessage` takes it unchanged. Reply bodies resolve *better* here than over REST, because the dispatch payload carries `referenced_message` that `GET /messages` often omits.
+- `reactions` is always absent from the payload, so a live line can never show reaction counts. Those arrive as separate dispatches carrying no message body.
+- `optimistic` and `state === "SENDING"` must both be dropped or self-sent messages arrive twice.
+- Flux handlers are subscribed when the dispatcher is *found*, which is before `start()` runs — so every module-level thing they touch must tolerate being null, and the watch gate has to live inside the handler. Mutating `plugin.flux` later does nothing; the object is read once at subscribe time, which is why toggling can't add or remove handlers.
+- A channel's id can equal its guild's id. Old guilds gave the default channel the guild's own snowflake, and `#pz_chat` in Project Zomboid's server still does. Code that assumes the two differ will be wrong there.
+
+Attachments deliberately don't earn an interrupt: a channel with a CI bot posting build artifacts would turn the interrupt tier into a pager. Bots are excluded for the same reason. Logs still land in the buffer, they just don't break concentration. The one rule that catches feedback about your work is the user-supplied term list, because those conversations frequently never name you.
+
+Deletes are subscribed but never reported — the payload carries no body, and several plugins dispatch synthetic deletes for their own UI. The subscription exists purely to drop an entry that hasn't drained, so a message deleted before anything read it is never delivered at all. That property only exists because there is a buffer.
+
+Watches lapse after four hours with a loud toast. A watcher that stops silently is worse than one that never stopped, because you believe you are covered when you are not — but a watch left running overnight into a forgotten channel is the real privacy failure, so it expires and says so. Only the intent survives a `Ctrl+R`; message bodies are never written to disk.
+
 ## Cache versus REST
 
 `current_view` reads `MessageStore` first because it's instant. But the cache only holds what has actually been rendered, and Discord caps it around 50 per channel — so it refetches over REST whenever the cache came up short of what was asked for, and flags `fromCache: false`.
