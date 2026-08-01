@@ -258,8 +258,11 @@ function evict(): void {
  * Attachments deliberately do NOT qualify: a channel with a bot posting build
  * artifacts would turn the interrupt tier into a pager. Logs still land in the
  * buffer, they just don't break concentration.
+ *
+ * A DM has no ambient tier at all, so everything in one qualifies — see the
+ * note on the fallback at the bottom.
  */
-function notabilityOf(raw: any, meId: string): LiveMessage["reason"] {
+function notabilityOf(raw: any, meId: string, isDm: boolean): LiveMessage["reason"] {
     if (Array.isArray(raw?.mentions) && raw.mentions.some((u: any) => String(u?.id) === meId)) {
         return "mention";
     }
@@ -274,7 +277,17 @@ function notabilityOf(raw: any, meId: string): LiveMessage["reason"] {
         const body = fold(String(raw?.content ?? ""));
         if (body && terms.some(t => body.includes(t))) return "term";
     }
-    return null;
+
+    // Everything in a DM is notable, because a DM has no ambient tier: each
+    // message is addressed to you personally, and nobody @-mentions or uses the
+    // reply affordance in a one-to-one. Without this the guild rules would find
+    // nothing to fire on, so the buffer would fill correctly while the hook —
+    // which reads notable-only, and is what makes the button sufficient — stayed
+    // silent. That failure looks exactly like a watch that never armed.
+    //
+    // Group DMs count too. They're small enough that volume isn't the problem it
+    // is in a public channel, and being in one is already the reason to watch it.
+    return isDm ? "dm" : null;
 }
 
 /**
@@ -308,7 +321,7 @@ export function onMessageCreate(payload: any): void {
     // guildId is taken from the channel, never from the payload, because
     // toBridgeMessage resolves mentions and roles against it.
     const channel = resolveChannel(channelId);
-    const reason = notabilityOf(raw, meId);
+    const reason = notabilityOf(raw, meId, channel?.isDm ?? false);
     const entry: LiveMessage = {
         message: toBridgeMessage(raw, channel),
         notable: reason !== null,

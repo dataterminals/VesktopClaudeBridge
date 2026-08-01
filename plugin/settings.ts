@@ -91,6 +91,12 @@ export const settings = definePluginSettings({
         description:
             "Third eye: also watch bot and webhook messages. Off by default — a CI bot posting build logs is the highest-volume thing in most channels.",
         default: false
+    },
+    thirdEyeWatchDms: {
+        type: OptionType.BOOLEAN,
+        description:
+            "Third eye: allow watching DMs. Off by default — \"read my Discord\" shouldn't quietly mean all of it. The sidecar keeps its own switch: set \"denyDms\": false in its config too, or the buffer fills and then the drain is refused at the boundary.",
+        default: false
     }
 });
 

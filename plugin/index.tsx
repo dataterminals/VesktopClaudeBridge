@@ -101,10 +101,10 @@ async function toggleThirdEye() {
         toast("Open a channel first", Toasts.Type.FAILURE);
         return;
     }
-    if (channel.isDm) {
-        // The sidecar would refuse this content anyway; refusing here means it
-        // never enters the renderer's buffer in the first place.
-        toast("Third eye doesn't watch DMs", Toasts.Type.FAILURE);
+    if (channel.isDm && !settings.store.thirdEyeWatchDms) {
+        // Refusing here rather than at the drain means DM content never enters
+        // the renderer's buffer at all, which is the stronger guarantee.
+        toast("Third eye doesn't watch DMs — turn it on in plugin settings", Toasts.Type.FAILURE);
         return;
     }
 

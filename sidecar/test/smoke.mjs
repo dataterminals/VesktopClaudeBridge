@@ -27,7 +27,15 @@ const HTTP_PORT = 8900;
 const TOKEN = "smoke-test-token-not-a-real-secret";
 const BASE = `http://127.0.0.1:${HTTP_PORT}`;
 
+// A second sidecar with the DM guard opened, so one run covers both sides of
+// `denyDms`. Two processes rather than a restart: the config is read once at
+// boot, and a half-configured sidecar is not a state worth being able to reach.
+const WS_PORT_DM = 8901;
+const HTTP_PORT_DM = 8902;
+const BASE_DM = `http://127.0.0.1:${HTTP_PORT_DM}`;
+
 const workDir = mkdtempSync(join(tmpdir(), "vcb-smoke-"));
+const workDirDm = mkdtempSync(join(tmpdir(), "vcb-smoke-dm-"));
 
 let passed = 0;
 const failures = [];
@@ -105,11 +113,27 @@ const LIVE = [
     { message: MESSAGES[1], notable: true, reason: "mention" }
 ];
 
+// The same traffic as seen inside a DM, where the plugin marks everything
+// notable: a one-to-one has no ambient tier, so nothing would ever fire the
+// mention/reply/term rules and the notable-only hook would stay silent.
+const DM_MESSAGES = MESSAGES.map(m => ({
+    ...m,
+    channelId: DM_CHANNEL.id,
+    guildId: null,
+    link: `https://discord.com/channels/@me/${DM_CHANNEL.id}/${m.id}`
+}));
+
+const DM_THIRD_EYE_STATE = {
+    ...THIRD_EYE_STATE, guild: null, channel: DM_CHANNEL, pending: 2, notablePending: 2
+};
+
+const DM_LIVE = DM_MESSAGES.map(message => ({ message, notable: true, reason: "dm" }));
+
 // --- fake plugin -----------------------------------------------------------
 
-function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
+function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS_PORT, dm = false } = {}) {
     return new Promise((resolve, reject) => {
-        const socket = new WebSocket(`ws://127.0.0.1:${WS_PORT}`, { origin });
+        const socket = new WebSocket(`ws://127.0.0.1:${wsPort}`, { origin });
         const closes = [];
         // Params the sidecar actually put on the wire, per method.
         const received = {};
@@ -146,15 +170,17 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
                     case "guilds":
                         return answer({ guilds: [GUILD] });
                     case "third_eye.state":
-                        return answer(THIRD_EYE_STATE);
-                    case "third_eye.drain":
+                        return answer(dm ? DM_THIRD_EYE_STATE : THIRD_EYE_STATE);
+                    case "third_eye.drain": {
+                        const buffer = dm ? DM_LIVE : LIVE;
                         return answer({
-                            state: THIRD_EYE_STATE,
+                            state: dm ? DM_THIRD_EYE_STATE : THIRD_EYE_STATE,
                             messages: frame.params?.notableOnly
-                                ? LIVE.filter(m => m.notable)
-                                : LIVE,
+                                ? buffer.filter(m => m.notable)
+                                : buffer,
                             dropped: 2
                         });
+                    }
                     case "search":
                         return answer({
                             guild: GUILD, totalResults: 385, hits: SEARCH_HITS,
@@ -177,38 +203,55 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
     });
 }
 
-const get = (path, token = TOKEN) =>
-    fetch(BASE + path, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+const getFrom = (base, path, token = TOKEN) =>
+    fetch(base + path, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+
+const get = (path, token = TOKEN) => getFrom(BASE, path, token);
 
 // --- run -------------------------------------------------------------------
 
-const child = spawn(process.execPath, ["dist/index.js", "--no-mcp"], {
-    cwd: ROOT,
-    env: {
-        ...process.env,
-        VCB_PORT: String(WS_PORT),
-        VCB_HTTP_PORT: String(HTTP_PORT),
-        VCB_TOKEN: TOKEN,
-        VCB_CONFIG_DIR: workDir,
-        VCB_DOWNLOAD_DIR: join(workDir, "downloads"),
-        VCB_LOG_LEVEL: "warn"
-    },
-    stdio: ["ignore", "inherit", "pipe"]
-});
-
 let stderr = "";
-child.stderr.on("data", d => { stderr += d.toString(); });
+
+function spawnSidecar({ wsPort, httpPort, dir, env = {} }) {
+    const proc = spawn(process.execPath, ["dist/index.js", "--no-mcp"], {
+        cwd: ROOT,
+        env: {
+            ...process.env,
+            VCB_PORT: String(wsPort),
+            VCB_HTTP_PORT: String(httpPort),
+            VCB_TOKEN: TOKEN,
+            VCB_CONFIG_DIR: dir,
+            VCB_DOWNLOAD_DIR: join(dir, "downloads"),
+            VCB_LOG_LEVEL: "warn",
+            ...env
+        },
+        stdio: ["ignore", "inherit", "pipe"]
+    });
+    proc.stderr.on("data", d => { stderr += d.toString(); });
+    return proc;
+}
+
+const child = spawnSidecar({ wsPort: WS_PORT, httpPort: HTTP_PORT, dir: workDir });
+const childDm = spawnSidecar({
+    wsPort: WS_PORT_DM,
+    httpPort: HTTP_PORT_DM,
+    dir: workDirDm,
+    env: { VCB_DENY_DMS: "0" }
+});
 
 function cleanup(code) {
     child.kill();
-    try { rmSync(workDir, { recursive: true, force: true }); } catch { /* windows file locks */ }
+    childDm.kill();
+    for (const dir of [workDir, workDirDm]) {
+        try { rmSync(dir, { recursive: true, force: true }); } catch { /* windows file locks */ }
+    }
     process.exit(code);
 }
 
-async function waitForPort(attempts = 50) {
+async function waitForPort(base = BASE, attempts = 50) {
     for (let i = 0; i < attempts; i++) {
         try {
-            await get("/status");
+            await getFrom(base, "/status");
             return true;
         } catch {
             await new Promise(r => setTimeout(r, 100));
@@ -278,6 +321,27 @@ try {
     const marked = await get("/marked");
     check("DM content is refused", marked.status === 403, `got ${marked.status}`);
     check("and names the setting", (await marked.text()).includes("denyDms"));
+
+    console.log("\nscope guard, opened (denyDms: false)");
+    if (!(await waitForPort(BASE_DM))) {
+        check("the second sidecar came up", false, "it never started");
+    } else {
+        await fakePlugin({ wsPort: WS_PORT_DM, dm: true });
+
+        const markedDm = await getFrom(BASE_DM, "/marked");
+        check("the same DM content is served", markedDm.status === 200, `got ${markedDm.status}`);
+        check("and carries the body", (await markedDm.text()).includes("did the pak actually load"));
+
+        // The counterpart to the plugin marking every DM message notable. If that
+        // tier were empty in a DM, the buffer would still fill and this hook would
+        // still run -- and print nothing, which is indistinguishable from a watch
+        // that never armed. So pin that notable-only is non-empty here.
+        const liveDm = await getFrom(BASE_DM, "/live?notableOnly=1");
+        check("a notable-only DM drain is served", liveDm.status === 200, `got ${liveDm.status}`);
+        const liveDmBody = await liveDm.text();
+        check("and is not empty", liveDmBody.includes("did the pak actually load"));
+        check("and names the DM it came from", liveDmBody.includes("dm:bob"));
+    }
 
     console.log("\nhistory anchors");
     // Discord ignores `before` when `after` is present, so the plugin enforces the

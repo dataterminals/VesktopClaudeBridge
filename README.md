@@ -137,6 +137,10 @@ Set **Third eye terms** in the plugin settings to a comma-separated list of thin
 
 Watches lapse after four hours and say so. Turning Discord off and on again keeps the watch but drops anything unread, because message bodies are never written to disk.
 
+**DMs need two switches, and they are deliberately separate.** Set **Third eye watch DMs** in the plugin settings to let the buffer fill from a DM at all, and `denyDms: false` in the sidecar config to let that content leave the renderer. Flip only the first and the buffer fills correctly and then the drain is refused at the boundary; flip only the second and the button still won't arm. The split is the point — the plugin setting decides what is *collected*, the sidecar decides what reaches a model — but it does mean a half-configured setup fails in two different-looking ways.
+
+Inside a DM every message counts as notable, because a one-to-one has no ambient tier to sort against: nobody @-mentions you or uses the reply affordance, so the guild rules would find nothing to fire on and the notable-only hook below would stay silent while the buffer filled. Group DMs count the same way.
+
 For the button alone to be enough, register the hook — otherwise you'd have to tell Claude the watch is running once per session:
 
 ```json
@@ -205,7 +209,7 @@ This is also the fastest way to debug the bridge itself, since it doesn't need M
 npm test
 ```
 
-Boots the real sidecar with a fake plugin standing in for Discord, then checks the things that are invisible until you're debugging live: token and origin rejection, the `no_client` path, code fences surviving the formatter unindented, and the DM guard actually refusing.
+Boots the real sidecar with a fake plugin standing in for Discord, then checks the things that are invisible until you're debugging live: token and origin rejection, the `no_client` path, code fences surviving the formatter unindented, and the DM guard refusing — plus a second sidecar with `denyDms: false` to check it then *serves*, including a notable-only drain of a DM coming back non-empty.
 
 The plugin half has no runtime tests — it needs a live client. Typecheck it against a real checkout instead:
 
@@ -219,7 +223,7 @@ A websocket on loopback has no same-origin protection — any page you visit can
 
 Scope defaults, in `%APPDATA%\vesktop-claude-bridge\config.json`:
 
-- `denyDms: true` — "read my discord" shouldn't quietly mean all of it.
+- `denyDms: true` — "read my discord" shouldn't quietly mean all of it. Third eye has its own switch for the same question (see above); this one governs every tool, that one governs what the renderer will even buffer.
 - `allowGuilds: []` — set guild ids to restrict further. Empty means all.
 - `pseudonymize: false` — flip on to replace handles with `user_a`, `user_b` on the way out, so real handles never reach the model's context. Handy when the transcript is headed for a public repo.
 

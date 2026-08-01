@@ -156,10 +156,10 @@ export interface MarkedItem {
  */
 export interface LiveMessage {
     message: BridgeMessage;
-    /** Mention of you, reply to you, or a term you named. */
+    /** Mention of you, reply to you, a term you named, or any message in a DM. */
     notable: boolean;
     /** Which rule fired, so a digest can say why without re-deriving it. */
-    reason: "mention" | "reply" | "term" | null;
+    reason: "mention" | "reply" | "term" | "dm" | null;
 }
 
 export interface ThirdEyeState {
