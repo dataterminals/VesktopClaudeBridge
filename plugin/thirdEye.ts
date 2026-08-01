@@ -54,8 +54,28 @@ let seen = 0;
 let matched = 0;
 let dropped = 0;
 
-/** Parsed once, not per message — this runs on every MESSAGE_CREATE. */
+/**
+ * Watch terms, parsed lazily.
+ *
+ * This runs on every MESSAGE_CREATE, so it must not re-split the setting each
+ * time — but it also has to notice an edit made in the settings UI without
+ * waiting for a reload. Comparing the raw string is cheap enough to do per
+ * message and gets both.
+ */
 let terms: string[] = [];
+let termsRaw: string | null = null;
+
+/**
+ * Fold away spacing and punctuation on both sides before matching.
+ *
+ * People write the same mod both ways in the same breath — "UnkillablesRebalance"
+ * and "Unkillables rebalance" both appear in the channel this was built for — and
+ * a plain substring test catches only whichever form the user happened to type
+ * into the settings box.
+ */
+function fold(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 
 let onNotable: ((entry: LiveMessage) => void) | null = null;
 let onExpire: ((channel: BridgeChannel | null) => void) | null = null;
@@ -92,10 +112,14 @@ export function watchedChannelId(): string | null {
 }
 
 export function refreshTerms(): void {
-    terms = String(settings.store.thirdEyeTerms ?? "")
+    const raw = String(settings.store.thirdEyeTerms ?? "");
+    if (raw === termsRaw) return;
+    termsRaw = raw;
+    terms = raw
         .split(",")
-        .map(t => t.trim().toLowerCase())
-        .filter(Boolean);
+        .map(t => fold(t))
+        // Two characters folds to noise; "ai" would match half the channel.
+        .filter(t => t.length >= 3);
 }
 
 export function setCallbacks(
@@ -244,8 +268,10 @@ function notabilityOf(raw: any, meId: string): LiveMessage["reason"] {
     const repliedTo = raw?.referenced_message;
     if (repliedTo && String(repliedTo?.author?.id ?? "") === meId) return "reply";
 
+    // Picks up settings-UI edits without a reload; no-ops when unchanged.
+    refreshTerms();
     if (terms.length) {
-        const body = String(raw?.content ?? "").toLowerCase();
+        const body = fold(String(raw?.content ?? ""));
         if (body && terms.some(t => body.includes(t))) return "term";
     }
     return null;
