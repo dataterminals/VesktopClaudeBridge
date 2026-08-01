@@ -5,7 +5,7 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "node \"D:/Github Repositories/VesktopClaudeBridge/scripts/third-eye-hook.mjs\"",
+                        "command": "node \"$CLAUDE_PROJECT_DIR/scripts/third-eye-hook.mjs\"",
                         "timeout": 5
                     }
                 ]
