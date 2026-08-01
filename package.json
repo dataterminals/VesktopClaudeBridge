@@ -1,0 +1,16 @@
+{
+    "name": "vesktop-claude-bridge",
+    "version": "0.1.0",
+    "description": "Read your Discord from Claude Code: an Equicord/Vencord plugin plus a local MCP sidecar",
+    "license": "GPL-3.0-or-later",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "sync": "node scripts/sync-protocol.mjs",
+        "build": "npm run sync && npm --prefix sidecar run build",
+        "typecheck": "npm run sync && npm --prefix sidecar run typecheck",
+        "test": "npm --prefix sidecar run test",
+        "start": "npm --prefix sidecar run start",
+        "install:sidecar": "npm --prefix sidecar install"
+    }
+}

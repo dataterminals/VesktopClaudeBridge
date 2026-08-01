@@ -1,0 +1,240 @@
+/*
+ * VesktopClaudeBridge
+ * Copyright (c) 2026 dataterminals
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Wire protocol shared by the Equicord plugin (renderer) and the sidecar (Node).
+ *
+ * This file is the single source of truth. `scripts/install-plugin.ps1` copies it
+ * into the plugin folder inside the Equicord tree, and `sidecar/src/protocol.ts`
+ * re-exports it. Edit it HERE, nowhere else.
+ */
+
+export const PROTOCOL_VERSION = 1;
+export const DEFAULT_PORT = 8787;
+
+/** Origins the sidecar will accept a plugin socket from. */
+export const ALLOWED_ORIGINS = [
+    "https://discord.com",
+    "https://ptb.discord.com",
+    "https://canary.discord.com"
+];
+
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
+
+export interface BridgeUser {
+    id: string;
+    /** Discord username (the @handle, no discriminator on the new system). */
+    username: string;
+    /** Server nickname if present, else global display name, else username. */
+    displayName: string;
+    bot: boolean;
+}
+
+export interface BridgeAttachment {
+    id: string;
+    filename: string;
+    size: number;
+    contentType: string | null;
+    /**
+     * Signed CDN url. These expire (the `ex`/`is`/`hm` query params), so treat
+     * them as short-lived — hand them to `attachment.fetch` promptly.
+     */
+    url: string;
+    /** Heuristic: is this something worth reading as text (a log, a diff, json...). */
+    likelyText: boolean;
+}
+
+export interface BridgeEmbed {
+    type: string | null;
+    title: string | null;
+    description: string | null;
+    url: string | null;
+    author: string | null;
+    footer: string | null;
+    fields: { name: string; value: string; }[];
+}
+
+export interface BridgeReaction {
+    emoji: string;
+    count: number;
+    me: boolean;
+}
+
+export interface BridgeReplyRef {
+    id: string | null;
+    author: string | null;
+    /** First ~120 chars of the message being replied to, resolved. */
+    excerpt: string | null;
+    /** True when Discord did not give us the referenced message body. */
+    unresolved: boolean;
+}
+
+export interface BridgeMessage {
+    id: string;
+    channelId: string;
+    guildId: string | null;
+    author: BridgeUser;
+    /** ISO 8601, always UTC. */
+    timestamp: string;
+    editedTimestamp: string | null;
+    /**
+     * Message body with mentions, channel links, custom emoji and <t:> stamps
+     * already resolved to readable text. Code fences are preserved byte-exact.
+     */
+    content: string;
+    replyTo: BridgeReplyRef | null;
+    attachments: BridgeAttachment[];
+    embeds: BridgeEmbed[];
+    reactions: BridgeReaction[];
+    pinned: boolean;
+    /** Permalink, so a human can jump to it. */
+    link: string;
+    /** Present when `content` was cut down; use `history` with `around` to expand. */
+    truncated?: { originalLength: number; };
+}
+
+export interface BridgeChannel {
+    id: string;
+    name: string;
+    /** Numeric Discord channel type, kept raw so the sidecar can label it. */
+    type: number;
+    topic: string | null;
+    guildId: string | null;
+    parentId: string | null;
+    isThread: boolean;
+    isDm: boolean;
+}
+
+export interface BridgeGuild {
+    id: string;
+    name: string;
+}
+
+export interface CurrentView {
+    guild: BridgeGuild | null;
+    channel: BridgeChannel | null;
+    messages: BridgeMessage[];
+    /** ISO timestamp of when the plugin snapshotted this. */
+    capturedAt: string;
+    /** True when messages came from the client cache rather than a REST fetch. */
+    fromCache: boolean;
+}
+
+export interface MarkedItem {
+    /** Monotonic per-session id, so `marked.clear` can drop a single entry. */
+    markId: number;
+    markedAt: string;
+    note: string | null;
+    guild: BridgeGuild | null;
+    channel: BridgeChannel | null;
+    messages: BridgeMessage[];
+}
+
+// ---------------------------------------------------------------------------
+// RPC surface
+// ---------------------------------------------------------------------------
+
+export type RpcMethod =
+    | "ping"
+    | "current_view"
+    | "history"
+    | "resolve_link"
+    | "marked.list"
+    | "marked.clear"
+    | "guilds"
+    | "channels";
+
+export interface RpcParams {
+    ping: Record<string, never>;
+    current_view: { limit?: number; };
+    history: {
+        channelId: string;
+        limit?: number;
+        before?: string;
+        after?: string;
+        around?: string;
+    };
+    resolve_link: { url: string; context?: number; };
+    "marked.list": { consume?: boolean; };
+    "marked.clear": { markId?: number; };
+    guilds: Record<string, never>;
+    channels: { guildId: string; };
+}
+
+export interface RpcResults {
+    ping: { pong: true; user: BridgeUser | null; };
+    current_view: CurrentView;
+    history: { channel: BridgeChannel | null; messages: BridgeMessage[]; };
+    resolve_link: {
+        guild: BridgeGuild | null;
+        channel: BridgeChannel | null;
+        target: BridgeMessage | null;
+        context: BridgeMessage[];
+    };
+    "marked.list": { items: MarkedItem[]; };
+    "marked.clear": { cleared: number; };
+    guilds: { guilds: BridgeGuild[]; };
+    channels: { channels: BridgeChannel[]; };
+}
+
+export interface RpcError {
+    code:
+        | "no_client"
+        | "timeout"
+        | "bad_params"
+        | "not_found"
+        | "forbidden"
+        | "discord_error"
+        | "internal";
+    message: string;
+}
+
+// ---------------------------------------------------------------------------
+// Envelopes
+// ---------------------------------------------------------------------------
+
+/** plugin -> sidecar, first frame. */
+export interface HelloFrame {
+    t: "hello";
+    protocol: number;
+    token: string;
+    user: BridgeUser | null;
+    pluginVersion: string;
+}
+
+/** sidecar -> plugin, acknowledges `hello`. */
+export interface HelloOkFrame {
+    t: "hello-ok";
+    protocol: number;
+    sidecarVersion: string;
+}
+
+/** sidecar -> plugin. */
+export interface ReqFrame {
+    t: "req";
+    id: string;
+    method: RpcMethod;
+    params: unknown;
+}
+
+/** plugin -> sidecar. */
+export type ResFrame =
+    | { t: "res"; id: string; ok: true; data: unknown; }
+    | { t: "res"; id: string; ok: false; error: RpcError; };
+
+/** plugin -> sidecar, unsolicited. */
+export interface EventFrame {
+    t: "event";
+    event: "marked" | "view-changed";
+    data: unknown;
+}
+
+export type PluginFrame = HelloFrame | ResFrame | EventFrame;
+export type SidecarFrame = HelloOkFrame | ReqFrame;
+
+export function isPluginFrame(v: unknown): v is PluginFrame {
+    return typeof v === "object" && v !== null && typeof (v as { t?: unknown; }).t === "string";
+}

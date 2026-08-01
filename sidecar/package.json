@@ -1,0 +1,33 @@
+{
+    "name": "vesktop-claude-bridge-sidecar",
+    "version": "0.1.0",
+    "description": "Local sidecar that bridges the VesktopClaudeBridge Equicord plugin to an MCP server + localhost HTTP API",
+    "license": "GPL-3.0-or-later",
+    "type": "module",
+    "private": true,
+    "bin": {
+        "vesktop-claude-bridge": "dist/index.js"
+    },
+    "scripts": {
+        "sync": "node ../scripts/sync-protocol.mjs",
+        "prebuild": "npm run sync",
+        "build": "tsc -p .",
+        "watch": "tsc -w -p .",
+        "pretypecheck": "npm run sync",
+        "typecheck": "tsc --noEmit -p .",
+        "start": "node dist/index.js",
+        "token": "node dist/index.js --print-token",
+        "pretest": "npm run build",
+        "test": "node test/smoke.mjs"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.12.0",
+        "ws": "^8.18.0",
+        "zod": "^3.24.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.0",
+        "@types/ws": "^8.5.13",
+        "typescript": "^5.7.0"
+    }
+}

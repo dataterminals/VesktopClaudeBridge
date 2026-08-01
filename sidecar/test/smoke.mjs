@@ -1,0 +1,254 @@
+#!/usr/bin/env node
+/*
+ * VesktopClaudeBridge
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * End-to-end smoke test for the sidecar, with a fake plugin standing in for
+ * Discord. Boots the real process, does the real handshake, answers real RPCs
+ * with fixture data, and checks what comes back out of the HTTP api.
+ *
+ * Covers the things that are easy to get wrong and invisible until you're
+ * debugging live: token rejection, origin rejection, code fences surviving the
+ * formatter, and the DM guard actually refusing.
+ *
+ *   node test/smoke.mjs
+ */
+
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { WebSocket } from "ws";
+
+const ROOT = join(fileURLToPath(import.meta.url), "..", "..");
+const WS_PORT = 8899;
+const HTTP_PORT = 8900;
+const TOKEN = "smoke-test-token-not-a-real-secret";
+const BASE = `http://127.0.0.1:${HTTP_PORT}`;
+
+const workDir = mkdtempSync(join(tmpdir(), "vcb-smoke-"));
+
+let passed = 0;
+const failures = [];
+
+function check(name, condition, detail = "") {
+    if (condition) {
+        passed++;
+        console.log(`  ok   ${name}`);
+    } else {
+        failures.push(`${name}${detail ? ` — ${detail}` : ""}`);
+        console.log(`  FAIL ${name}${detail ? ` — ${detail}` : ""}`);
+    }
+}
+
+// --- fixtures --------------------------------------------------------------
+
+const CHANNEL = {
+    id: "2000", name: "modding-help", type: 0, topic: null,
+    guildId: "1000", parentId: null, isThread: false, isDm: false
+};
+
+const DM_CHANNEL = { ...CHANNEL, id: "2999", name: "dm:bob", type: 1, guildId: null, isDm: true };
+
+const GUILD = { id: "1000", name: "Test Server" };
+
+const user = (id, name) => ({ id, username: name, displayName: name, bot: false });
+
+const MESSAGES = [
+    {
+        id: "3001", channelId: "2000", guildId: "1000", author: user("9001", "Sylvia"),
+        timestamp: "2026-08-01T14:31:02.000Z", editedTimestamp: null,
+        content: "did the pak actually load", replyTo: null,
+        attachments: [], embeds: [], reactions: [], pinned: false,
+        link: "https://discord.com/channels/1000/2000/3001"
+    },
+    {
+        id: "3002", channelId: "2000", guildId: "1000", author: user("9002", "Bob"),
+        timestamp: "2026-08-01T14:32:40.000Z", editedTimestamp: null,
+        // A fenced log, which is the whole reason this project exists.
+        content: "nope:\n```\n[2026.08.01-14.32.55:123][  0]LogUE4SS: mod folder not found\n```",
+        replyTo: { id: "3001", author: "Sylvia", excerpt: "did the pak actually load", unresolved: false },
+        attachments: [{
+            id: "4001", filename: "UE4SS.log", size: 44236, contentType: "text/plain",
+            url: "https://cdn.discordapp.com/attachments/2000/4001/UE4SS.log", likelyText: true
+        }],
+        embeds: [], reactions: [{ emoji: "👍", count: 2, me: false }], pinned: false,
+        link: "https://discord.com/channels/1000/2000/3002"
+    }
+];
+
+// --- fake plugin -----------------------------------------------------------
+
+function fakePlugin({ token = TOKEN, origin = "https://discord.com" } = {}) {
+    return new Promise((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${WS_PORT}`, { origin });
+        const closes = [];
+
+        socket.on("open", () => {
+            socket.send(JSON.stringify({
+                t: "hello", protocol: 1, token,
+                user: user("9001", "Sylvia"), pluginVersion: "0.1.0-test"
+            }));
+        });
+
+        socket.on("message", raw => {
+            const frame = JSON.parse(raw.toString());
+
+            if (frame.t === "hello-ok") return resolve({ socket, closes });
+
+            if (frame.t === "req") {
+                const answer = data => socket.send(JSON.stringify({ t: "res", id: frame.id, ok: true, data }));
+
+                switch (frame.method) {
+                    case "current_view":
+                        return answer({
+                            guild: GUILD, channel: CHANNEL, messages: MESSAGES,
+                            capturedAt: "2026-08-01T14:36:00.000Z", fromCache: true
+                        });
+                    case "marked.list":
+                        return answer({ items: [{
+                            markId: 1, markedAt: "2026-08-01T14:36:10.000Z", note: "last 2",
+                            guild: GUILD, channel: DM_CHANNEL, messages: MESSAGES
+                        }] });
+                    case "guilds":
+                        return answer({ guilds: [GUILD] });
+                    default:
+                        return socket.send(JSON.stringify({
+                            t: "res", id: frame.id, ok: false,
+                            error: { code: "internal", message: `fixture missing for ${frame.method}` }
+                        }));
+                }
+            }
+        });
+
+        socket.on("close", code => {
+            closes.push(code);
+            reject(new Error(`socket closed with ${code}`));
+        });
+        socket.on("error", err => reject(err));
+    });
+}
+
+const get = (path, token = TOKEN) =>
+    fetch(BASE + path, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+
+// --- run -------------------------------------------------------------------
+
+const child = spawn(process.execPath, ["dist/index.js", "--no-mcp"], {
+    cwd: ROOT,
+    env: {
+        ...process.env,
+        VCB_PORT: String(WS_PORT),
+        VCB_HTTP_PORT: String(HTTP_PORT),
+        VCB_TOKEN: TOKEN,
+        VCB_CONFIG_DIR: workDir,
+        VCB_DOWNLOAD_DIR: join(workDir, "downloads"),
+        VCB_LOG_LEVEL: "warn"
+    },
+    stdio: ["ignore", "inherit", "pipe"]
+});
+
+let stderr = "";
+child.stderr.on("data", d => { stderr += d.toString(); });
+
+function cleanup(code) {
+    child.kill();
+    try { rmSync(workDir, { recursive: true, force: true }); } catch { /* windows file locks */ }
+    process.exit(code);
+}
+
+async function waitForPort(attempts = 50) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            await get("/status");
+            return true;
+        } catch {
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }
+    return false;
+}
+
+try {
+    if (!(await waitForPort())) {
+        console.error("sidecar never came up. stderr:\n" + stderr);
+        cleanup(1);
+    }
+
+    console.log("\nauth");
+    check("no token is rejected", (await get("/status", null)).status === 401);
+    check("wrong token is rejected", (await get("/status", "nope")).status === 401);
+    check("right token is accepted", (await get("/status")).status === 200);
+
+    console.log("\nbefore a plugin connects");
+    const cold = await get("/current-view");
+    check("reads fail with 503", cold.status === 503);
+    check("and say why", (await cold.text()).includes("no_client"));
+
+    console.log("\nhandshake");
+    await check2("bad origin is refused", async () => {
+        try {
+            await fakePlugin({ origin: "https://evil.example" });
+            return false;
+        } catch {
+            return true;
+        }
+    });
+    await check2("bad token is refused", async () => {
+        try {
+            await fakePlugin({ token: "wrong" });
+            return false;
+        } catch {
+            return true;
+        }
+    });
+
+    const { socket } = await fakePlugin();
+    check("good handshake connects", socket.readyState === WebSocket.OPEN);
+
+    const status = await (await get("/status")).json();
+    check("status reports connected", status.connected === true);
+    check("status reports the account", status.user?.displayName === "Sylvia");
+
+    console.log("\ntranscript");
+    const view = await (await get("/current-view")).text();
+    check("has a header", view.includes("#modding-help") && view.includes("Test Server"));
+    check("has the id range for paging", view.includes("ids 3001 → 3002"));
+    check("renders a one-liner", view.includes("[14:31:02] Sylvia: did the pak actually load"));
+    check("shows the reply target", view.includes("↳ replying to Sylvia"));
+    check("lists the attachment", view.includes("UE4SS.log") && view.includes("43.2 KB"));
+    check("shows reactions", view.includes("👍 2"));
+    check(
+        "code fence survives unindented",
+        view.includes("\n```\n[2026.08.01-14.32.55:123][  0]LogUE4SS: mod folder not found\n```"),
+        "fence was indented or mangled"
+    );
+    check("omits per-message ids by default", !view.includes("⟨3001⟩"));
+    check("ids=1 adds them back", (await (await get("/current-view?ids=1")).text()).includes("⟨3001⟩"));
+
+    console.log("\nscope guard");
+    const marked = await get("/marked");
+    check("DM content is refused", marked.status === 403, `got ${marked.status}`);
+    check("and names the setting", (await marked.text()).includes("denyDms"));
+
+    console.log("\njson mode");
+    const json = await (await get("/current-view?json=1")).json();
+    check("returns objects", Array.isArray(json.messages) && json.messages.length === 2);
+    check("keeps content verbatim", json.messages[1].content.includes("LogUE4SS"));
+
+    console.log(`\n${passed} passed, ${failures.length} failed`);
+    if (failures.length) {
+        console.error("\nfailures:\n" + failures.map(f => "  - " + f).join("\n"));
+        cleanup(1);
+    }
+    cleanup(0);
+} catch (err) {
+    console.error("smoke test blew up:", err);
+    console.error("sidecar stderr:\n" + stderr);
+    cleanup(1);
+}
+
+async function check2(name, fn) {
+    check(name, await fn());
+}
