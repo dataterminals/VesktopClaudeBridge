@@ -55,7 +55,13 @@ try {
     const token = readFileSync(join(configDir(), "token"), "utf8").trim();
     if (!token) process.exit(0);
 
-    const res = await fetch(`http://127.0.0.1:${readPort()}/live`, {
+    // notableOnly is not a tuning preference, it is what makes this affordable.
+    // Measured on a real channel: 475 messages/hour, of which ~1% were aimed at
+    // the user. Injecting the whole buffer would put ~3.6k tokens on every
+    // message they send and climb to ~11.7k once the ring fills — on the off
+    // chance any of it mattered. The rest is still there; `discord_live` reads
+    // it when they actually ask.
+    const res = await fetch(`http://127.0.0.1:${readPort()}/live?notableOnly=1`, {
         headers: { authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(TIMEOUT_MS)
     });

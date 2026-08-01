@@ -193,6 +193,42 @@ export async function loadThirdEye(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Drops the oldest ambient chatter first, and only touches notable messages once
+ * there is nothing else left to give up.
+ *
+ * A flat ring is the wrong shape here. Measured on a real channel: 475 messages
+ * an hour, so a 300-entry ring is full in 38 minutes and "what did I miss while
+ * I was heads-down for three hours" would return the last half hour of banter
+ * having already discarded the one reply that was actually for you. Notable
+ * entries are ~1% of traffic, so keeping them costs almost nothing and is the
+ * entire point of leaving this running.
+ */
+function evict(): void {
+    if (ring.length <= RING_MAX) return;
+
+    const excess = ring.length - RING_MAX;
+    let toDrop = excess;
+    const kept: LiveMessage[] = [];
+
+    for (const entry of ring) {
+        if (toDrop > 0 && !entry.notable) {
+            toDrop--;
+            dropped++;
+            continue;
+        }
+        kept.push(entry);
+    }
+
+    // Everything left is notable and it still doesn't fit: fall back to oldest-first.
+    if (kept.length > RING_MAX) {
+        dropped += kept.length - RING_MAX;
+        ring = kept.slice(-RING_MAX);
+        return;
+    }
+    ring = kept;
+}
+
+/**
  * What earns an interruption. Everything else still accumulates.
  *
  * Attachments deliberately do NOT qualify: a channel with a bot posting build
@@ -255,10 +291,7 @@ export function onMessageCreate(payload: any): void {
     if (entry.notable) matched++;
 
     ring.push(entry);
-    if (ring.length > RING_MAX) {
-        dropped += ring.length - RING_MAX;
-        ring = ring.slice(-RING_MAX);
-    }
+    evict();
 
     if (entry.notable) onNotable?.(entry);
 }
