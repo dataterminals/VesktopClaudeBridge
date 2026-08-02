@@ -4,7 +4,7 @@ Read your Discord from Claude Code — an Equicord/Vencord userplugin plus a loc
 
 Point at a message in Discord, and the model reads it. No screenshots, no copy-paste, no bot account.
 
-(Note from dataterminals: There's no chance in hell they'll let me put this on the official Equicord plugins repository because they're convinced that everyone who works with an AI just wants to play 90-day fiancee with the idea of long-term support, so this is the only place you're gonna find this thing. lol)
+(Note from dataterminals: There's no chance in hell they'll let me put this on the official Equicord plugins repository because they're convinced that everyone who works with an AI just wants to play 90-day fiancee with the idea of long-term support, so this is the only place you're gonna find this thing. lol. Anyways if you need support in 20 years from now, send me a letter via post-apocalyptic biomechanical carrier-pigeon)
 ---
 
 ## Why
