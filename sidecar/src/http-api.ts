@@ -23,7 +23,8 @@ import {
     assertAllowed,
     compactMessages,
     renderSearchResults,
-    renderTranscript
+    renderTranscript,
+    zoneNote
 } from "./format.js";
 import { log } from "./log.js";
 
@@ -123,6 +124,7 @@ export function startHttpApi(bridge: Bridge, cfg: Config): Server {
         ) =>
             renderTranscript(guild, channel, pseudo.apply(messages), {
                 truncateAt: cfg.truncateAt,
+                timezone: cfg.timezone,
                 ids
             });
 
@@ -196,12 +198,13 @@ export function startHttpApi(bridge: Bridge, cfg: Config): Server {
                         : "";
                     const body = compactMessages(pseudo.apply(out.messages.map(m => m.message)), {
                         truncateAt: cfg.truncateAt,
+                        timezone: cfg.timezone,
                         stamp: "datetime"
                     });
                     return send(
                         res,
                         200,
-                        `Third eye · ${where} · ${out.messages.length} new${gap}\n\n${body}\n`
+                        `Third eye · ${where} · ${out.messages.length} new · ${zoneNote(cfg.timezone)}${gap}\n\n${body}\n`
                     );
                 }
 
@@ -260,7 +263,11 @@ export function startHttpApi(bridge: Bridge, cfg: Config): Server {
                                       offset: out.offset,
                                       indexing: out.indexing
                                   },
-                                  { truncateAt: cfg.truncateAt, ids: q.get("ids") !== "0" }
+                                  {
+                                      truncateAt: cfg.truncateAt,
+                                      timezone: cfg.timezone,
+                                      ids: q.get("ids") !== "0"
+                                  }
                               ) + "\n"
                           );
                 }

@@ -70,7 +70,20 @@ async function main() {
     }
 
     if (args.has("--no-mcp")) {
-        log.info(`running without MCP (${owner ? "bridge + http" : "proxy"} only)`);
+        /*
+         * A proxy with no MCP client has nothing to do: the websocket and the
+         * HTTP mirror both belong to whoever got here first, and there is no
+         * stdio peer to serve. That is a perfectly good outcome — the bridge is
+         * up, just not ours — but exiting 0 in silence reads as a crash to
+         * anyone who got here by double-clicking a launcher. Say which it is.
+         */
+        if (!owner) {
+            log.info(`the bridge on :${cfg.port} is already up, owned by another process`);
+            log.info("nothing for this process to do — exiting");
+            await bridge.close();
+            return;
+        }
+        log.info("running without MCP (bridge + http only)");
     } else {
         const mcp = createMcpServer(bridge, cfg, VERSION);
         await serveMcpOverStdio(mcp);

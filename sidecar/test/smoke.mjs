@@ -223,6 +223,10 @@ function spawnSidecar({ wsPort, httpPort, dir, env = {} }) {
             VCB_CONFIG_DIR: dir,
             VCB_DOWNLOAD_DIR: join(dir, "downloads"),
             VCB_LOG_LEVEL: "warn",
+            // Pinned, or every stamp assertion below reads differently depending
+            // on which machine runs the suite. The rendering default is the
+            // host's own zone, which is right for a user and useless for a test.
+            VCB_TIMEZONE: "UTC",
             ...env
         },
         stdio: ["ignore", "inherit", "pipe"]
@@ -236,7 +240,11 @@ const childDm = spawnSidecar({
     wsPort: WS_PORT_DM,
     httpPort: HTTP_PORT_DM,
     dir: workDirDm,
-    env: { VCB_DENY_DMS: "0" }
+    // Also carries a non-UTC zone, so one run covers both sides of the rendering
+    // timezone as well. The fixtures are stamped in August, so America/New_York
+    // is EDT and every stamp here should land exactly four hours behind the
+    // primary sidecar's UTC — which is the whole point of the setting.
+    env: { VCB_DENY_DMS: "0", VCB_TIMEZONE: "America/New_York" }
 });
 
 function cleanup(code) {
@@ -314,6 +322,7 @@ try {
         view.includes("\n```\n[2026.08.01-14.32.55:123][  0]LogUE4SS: mod folder not found\n```"),
         "fence was indented or mangled"
     );
+    check("names the zone the stamps are in", view.includes("times in UTC"));
     check("omits per-message ids by default", !view.includes("⟨3001⟩"));
     check("ids=1 adds them back", (await (await get("/current-view?ids=1")).text()).includes("⟨3001⟩"));
 
@@ -341,6 +350,14 @@ try {
         const liveDmBody = await liveDm.text();
         check("and is not empty", liveDmBody.includes("did the pak actually load"));
         check("and names the DM it came from", liveDmBody.includes("dm:bob"));
+
+        // The fixture instant is 14:31:02Z. Rendered in America/New_York in
+        // August that is 10:31:02, and the UTC clock must not survive anywhere
+        // in the output — a stamp that renders correctly while the old one
+        // lingers in a header is the same bug wearing a hat.
+        check("renders stamps in the configured zone", liveDmBody.includes("2026-08-01 10:31:02"));
+        check("and leaves no UTC clock behind", !liveDmBody.includes("14:31:02"));
+        check("and says which zone that was", liveDmBody.includes("times in America/New_York"));
     }
 
     console.log("\nhistory anchors");

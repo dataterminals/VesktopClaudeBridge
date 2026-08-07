@@ -40,6 +40,19 @@ export interface Config {
     maxLimit: number;
     /** Message bodies longer than this get truncated in compact output. */
     truncateAt: number;
+    /**
+     * IANA zone name that rendered transcripts are stamped in, e.g.
+     * "America/New_York". Defaults to this machine's zone.
+     *
+     * Discord hands us UTC instants and the old renderer sliced the clock
+     * straight out of the ISO string, which published UTC as a bare `[14:31:02]`
+     * with nothing marking it as such. Every reader downstream — human or model —
+     * reads a bare clock time as local and is wrong by the offset. A transcript
+     * exists to be cross-referenced against the Discord client sitting next to
+     * it, so local is the useful default, and the zone is named in the header
+     * either way.
+     */
+    timezone: string;
     /** How long to wait for the plugin to answer an RPC. */
     rpcTimeoutMs: number;
     /** Enable the plain-HTTP API alongside MCP. */
@@ -86,14 +99,64 @@ export function loadToken(): string {
     return token;
 }
 
-function readConfigFile(): Partial<Config> {
+/**
+ * Reads the config file, if there is one.
+ *
+ * `null` means nothing usable came out of the file, and the caller should not
+ * second-guess why — each failure path here has already said its piece. Only one
+ * of them is quiet: no file at all, which is the ordinary first run, where
+ * `ensureConfigFile()` is about to write one and log that it did.
+ *
+ * The rest are loud on purpose. A config that exists but can't be read is
+ * indistinguishable from no config at all from in here, and the symptom
+ * downstream is the bridge listening on DEFAULT_PORT while the plugin dials the
+ * port you actually set. Nothing connects, and nothing anywhere says why.
+ *
+ * One read rather than `existsSync()` then `readFileSync()` — those two can
+ * disagree, and the disagreement used to land in the silent branch.
+ */
+function readConfigFile(): Partial<Config> | null {
     const file = CONFIG_FILE();
-    if (!existsSync(file)) return {};
+
+    let raw: string;
     try {
-        return JSON.parse(readFileSync(file, "utf8")) as Partial<Config>;
+        raw = readFileSync(file, "utf8");
     } catch (err) {
-        log.warn(`ignoring unreadable ${file}:`, err);
-        return {};
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        log.warn(`could not read ${file} — falling back to defaults:`, err);
+        return null;
+    }
+
+    // Strip a UTF-8 BOM. Notepad and PowerShell both write one by default on
+    // Windows, it is invisible in every editor, and JSON.parse rejects the whole
+    // file over it — which lands you right back in the silent-default case this
+    // function exists to make noisy. Tested by code point rather than matched as
+    // a literal, so the guard itself isn't an invisible character in the source.
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+
+    try {
+        return JSON.parse(raw) as Partial<Config>;
+    } catch (err) {
+        log.warn(`${file} is not valid JSON — falling back to defaults:`, err);
+        return null;
+    }
+}
+
+/**
+ * Resolves and validates the rendering timezone.
+ *
+ * A typo here would otherwise surface as times that are quietly wrong rather
+ * than as an error, so an unknown zone is named out loud and falls back to UTC —
+ * being obviously in UTC beats being invisibly off by hours.
+ */
+function resolveTimezone(requested: string | undefined): string {
+    const zone = requested?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    try {
+        new Intl.DateTimeFormat("en", { timeZone: zone });
+        return zone;
+    } catch {
+        log.warn(`"${zone}" is not a known IANA timezone — stamping transcripts in UTC instead`);
+        return "UTC";
     }
 }
 
@@ -111,9 +174,24 @@ function envInt(name: string): number | undefined {
 }
 
 export function loadConfig(): Config {
-    const file = readConfigFile();
+    const fromFile = readConfigFile();
+    const file = fromFile ?? {};
 
-    const port = envInt("VCB_PORT") ?? file.port ?? DEFAULT_PORT;
+    const envPort = envInt("VCB_PORT");
+    const port = envPort ?? file.port ?? DEFAULT_PORT;
+
+    /*
+     * Say where the port came from when it isn't the config file.
+     *
+     * A port mismatch is the one misconfiguration with no symptom of its own:
+     * both halves start cleanly, the plugin dials one number, the sidecar
+     * listens on another, and the only evidence is a client that never arrives.
+     */
+    if (envPort != null && file.port != null && envPort !== file.port) {
+        log.warn(`VCB_PORT=${envPort} overrides "port": ${file.port} in ${CONFIG_FILE()}`);
+    } else if (fromFile != null && file.port == null) {
+        log.warn(`no "port" in ${CONFIG_FILE()} — falling back to the default ${DEFAULT_PORT}`);
+    }
 
     const cfg: Config = {
         port,
@@ -129,6 +207,7 @@ export function loadConfig(): Config {
         defaultLimit: envInt("VCB_DEFAULT_LIMIT") ?? file.defaultLimit ?? 50,
         maxLimit: envInt("VCB_MAX_LIMIT") ?? file.maxLimit ?? 200,
         truncateAt: envInt("VCB_TRUNCATE_AT") ?? file.truncateAt ?? 1200,
+        timezone: resolveTimezone(process.env.VCB_TIMEZONE ?? file.timezone),
         rpcTimeoutMs: envInt("VCB_RPC_TIMEOUT_MS") ?? file.rpcTimeoutMs ?? 15_000,
         http: envFlag("VCB_HTTP") ?? file.http ?? true,
         logLevel: (process.env.VCB_LOG_LEVEL as LogLevel | undefined) ?? file.logLevel ?? "info"
@@ -147,6 +226,7 @@ export function ensureConfigFile(cfg: Config): string {
         port: cfg.port,
         httpPort: cfg.httpPort,
         downloadDir: cfg.downloadDir,
+        timezone: cfg.timezone,
         allowGuilds: [],
         denyDms: true,
         pseudonymize: false,

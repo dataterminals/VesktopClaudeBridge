@@ -22,7 +22,8 @@ import {
     channelTypeName,
     compactMessages,
     renderSearchResults,
-    renderTranscript
+    renderTranscript,
+    zoneNote
 } from "./format.js";
 import { log } from "./log.js";
 import type { BridgeMessage } from "./protocol.js";
@@ -60,6 +61,7 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
     ) =>
         renderTranscript(guild, channel, pseudo.apply(messages), {
             truncateAt: cfg.truncateAt,
+            timezone: cfg.timezone,
             ids
         });
 
@@ -241,8 +243,12 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                     return text(`${head.join("\n")}\n\nNothing new.`);
                 }
 
+                // Only once there are stamps for it to govern.
+                head.push(`── ${zoneNote(cfg.timezone)}`);
+
                 const body = compactMessages(pseudo.apply(res.messages.map(m => m.message)), {
                     truncateAt: cfg.truncateAt,
+                    timezone: cfg.timezone,
                     ids: ids ?? false,
                     stamp: "datetime"
                 });
@@ -345,7 +351,7 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                         offset: res.offset,
                         indexing: res.indexing
                     },
-                    { truncateAt: cfg.truncateAt, ids: ids ?? true }
+                    { truncateAt: cfg.truncateAt, timezone: cfg.timezone, ids: ids ?? true }
                 );
                 const note = dropped ? `\n\n(${dropped} hit(s) hidden by the sidecar's scope config)` : "";
                 return text(body + note);

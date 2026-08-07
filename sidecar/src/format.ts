@@ -119,6 +119,14 @@ export class Pseudonymizer {
 
 export interface CompactOptions {
     truncateAt: number;
+    /**
+     * IANA zone every stamp in this render is expressed in.
+     *
+     * Required rather than optional-with-a-default on purpose: a renderer that
+     * quietly picks a zone for you is precisely how a bare clock time ends up
+     * meaning something other than it appears to.
+     */
+    timezone: string;
     /** Emit a `⟨id⟩` marker on every message, not just in the header. */
     ids?: boolean;
     /**
@@ -130,13 +138,51 @@ export interface CompactOptions {
     stamp?: "time" | "datetime";
 }
 
-function hhmmss(iso: string): string {
-    return iso.length >= 19 ? iso.slice(11, 19) : iso;
+/**
+ * Renders a UTC instant in a named zone.
+ *
+ * This used to be `iso.slice(11, 19)`, which was free but published UTC dressed
+ * as an unlabelled wall clock. Everything downstream then read it as local and
+ * was wrong by the offset, silently and with no way to notice.
+ *
+ * `hourCycle: "h23"` rather than `hour12: false`, because the latter is supposed
+ * to give a 24-hour clock but renders midnight as "24" on some implementations.
+ * Parts are reassembled by name rather than trusting a locale to emit them in
+ * ISO order.
+ */
+function stamper(timezone: string) {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        hourCycle: "h23",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    });
+
+    return (iso: string, mode: CompactOptions["stamp"]): string => {
+        const at = new Date(iso);
+        if (Number.isNaN(at.getTime())) return iso;
+
+        const part: Record<string, string> = {};
+        for (const { type, value } of fmt.formatToParts(at)) part[type] = value;
+
+        const clock = `${part.hour}:${part.minute}:${part.second}`;
+        return mode === "datetime" ? `${part.year}-${part.month}-${part.day} ${clock}` : clock;
+    };
 }
 
-function stampFor(iso: string, mode: CompactOptions["stamp"]): string {
-    if (mode !== "datetime") return hhmmss(iso);
-    return iso.length >= 19 ? `${iso.slice(0, 10)} ${iso.slice(11, 19)}` : iso;
+/**
+ * The one place the rendered zone is spelled out.
+ *
+ * Every surface that emits stamps carries this, because the stamps themselves
+ * can't: putting an offset on each line would cost more than the transcript
+ * saves, and a header that governs the block reads once and covers all of it.
+ */
+export function zoneNote(timezone: string): string {
+    return `times in ${timezone}`;
 }
 
 function humanSize(bytes: number): string {
@@ -153,7 +199,8 @@ function truncate(text: string, limit: number): string {
 export function compactHeader(
     guild: BridgeGuild | null,
     channel: BridgeChannel | null,
-    messages: BridgeMessage[]
+    messages: BridgeMessage[],
+    opts: CompactOptions
 ): string {
     const where = channel
         ? `${channel.isDm ? "" : "#"}${channel.name}${channel.isThread ? " (thread)" : ""}`
@@ -168,14 +215,16 @@ export function compactHeader(
 
     const first = messages[0]!;
     const last = messages[messages.length - 1]!;
+    const at = stamper(opts.timezone);
     lines.push(
-        `── ${messages.length} messages · ${first.timestamp} → ${hhmmss(last.timestamp)} · ids ${first.id} → ${last.id}`
+        `── ${messages.length} messages · ${at(first.timestamp, "datetime")} → ${at(last.timestamp, "time")} · ${zoneNote(opts.timezone)} · ids ${first.id} → ${last.id}`
     );
     return lines.join("\n");
 }
 
 export function compactMessages(messages: BridgeMessage[], opts: CompactOptions): string {
     const out: string[] = [];
+    const at = stamper(opts.timezone);
 
     for (const m of messages) {
         const marks: string[] = [];
@@ -216,7 +265,7 @@ export function compactMessages(messages: BridgeMessage[], opts: CompactOptions)
 
         const name = m.author.displayName + (m.author.bot ? " [bot]" : "");
         const body = truncate(m.content, opts.truncateAt);
-        const stamp = stampFor(m.timestamp, opts.stamp);
+        const stamp = at(m.timestamp, opts.stamp);
 
         if (body.includes("\n")) {
             // Header line, then the body verbatim on its own lines. No indent —
@@ -240,7 +289,7 @@ export function renderTranscript(
     messages: BridgeMessage[],
     opts: CompactOptions
 ): string {
-    const header = compactHeader(guild, channel, messages);
+    const header = compactHeader(guild, channel, messages, opts);
     if (messages.length === 0) return header;
     return `${header}\n\n${compactMessages(messages, opts)}`;
 }
@@ -272,7 +321,7 @@ export function renderSearchResults(input: SearchRenderInput, opts: CompactOptio
     const shown = hits.length
         ? `showing ${offset + 1}-${offset + hits.length} of ${totalResults}`
         : `${totalResults} matches`;
-    const lines = [`── search${scope} · ${shown}`];
+    const lines = [`── search${scope} · ${shown} · ${zoneNote(opts.timezone)}`];
 
     if (indexing) {
         lines.push("── Discord is still building this server's search index; results may be incomplete.");
