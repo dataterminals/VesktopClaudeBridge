@@ -308,6 +308,10 @@ try {
     const status = await (await get("/status")).json();
     check("status reports connected", status.connected === true);
     check("status reports the account", status.user?.displayName === "Avery");
+    // What "already running" has to be able to name. Without it the only advice
+    // a second sidecar can give is "something else has it", which is useless.
+    check("status identifies the owning process", status.owner?.pid === child.pid);
+    check("and when it came up", typeof status.owner?.since === "string");
 
     console.log("\ntranscript");
     const view = await (await get("/current-view")).text();

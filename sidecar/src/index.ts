@@ -18,9 +18,12 @@ import { ensureConfigFile, loadConfig } from "./config.js";
 import { startHttpApi } from "./http-api.js";
 import { log, setLogLevel } from "./log.js";
 import { createMcpServer, serveMcpOverStdio } from "./mcp.js";
-import { RemoteBridge, findOwner } from "./remote-bridge.js";
+import { RemoteBridge, describeOwner, findOwner, stopOwner } from "./remote-bridge.js";
 
 const VERSION = "0.1.0";
+
+/** `--no-mcp` ran, found the bridge already served, and did nothing. Not a failure. */
+const EXIT_ALREADY_SERVED = 3;
 
 async function main() {
     const args = new Set(process.argv.slice(2));
@@ -49,11 +52,25 @@ async function main() {
     let bridge: Bridge;
     let owner = false;
 
-    if (await findOwner(cfg)) {
+    let existing = await findOwner(cfg);
+
+    /*
+     * --takeover exists for the hand-launched case: you opened a window meaning
+     * to run the sidecar here, found someone else already had it, and said take
+     * it anyway. It is never implied — a session-spawned sidecar that stole the
+     * socket from another session would be the worst possible default.
+     */
+    if (existing && args.has("--takeover")) {
+        log.info(`taking the bridge over from ${describeOwner(existing)}`);
+        if (await stopOwner(cfg, existing)) existing = null;
+        else log.warn("takeover failed; proxying through the existing owner instead");
+    }
+
+    if (existing) {
         const remote = new RemoteBridge(cfg);
         await remote.attach();
         bridge = remote;
-        log.info(`another sidecar owns the bridge on :${cfg.port}; proxying through :${cfg.httpPort}`);
+        log.info(`the bridge on :${cfg.port} is held by ${describeOwner(existing)}; proxying through :${cfg.httpPort}`);
     } else {
         const server = new BridgeServer(cfg, VERSION);
         await server.listen();
@@ -78,9 +95,17 @@ async function main() {
          * anyone who got here by double-clicking a launcher. Say which it is.
          */
         if (!owner) {
-            log.info(`the bridge on :${cfg.port} is already up, owned by another process`);
-            log.info("nothing for this process to do — exiting");
+            log.info(`the bridge on :${cfg.port} is already up and being served by ${describeOwner(existing!)}`);
+            log.info(
+                args.has("--takeover")
+                    ? "the takeover did not succeed, so this process is standing down"
+                    : "nothing for this process to do — re-run with --takeover to serve it here instead"
+            );
             await bridge.close();
+            // Distinct from both success and failure: nothing went wrong, but
+            // nothing was served either. The launcher branches on this to offer
+            // taking over rather than reporting a stop that never started.
+            process.exitCode = EXIT_ALREADY_SERVED;
             return;
         }
         log.info("running without MCP (bridge + http only)");

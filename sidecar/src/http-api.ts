@@ -28,6 +28,9 @@ import {
 } from "./format.js";
 import { log } from "./log.js";
 
+/** Stamped once, at import, so `/status` reports when this process came up. */
+const STARTED_AT = new Date().toISOString();
+
 export function startHttpApi(bridge: Bridge, cfg: Config): Server {
     const pseudo = new Pseudonymizer(cfg.pseudonymize);
 
@@ -132,11 +135,19 @@ export function startHttpApi(bridge: Bridge, cfg: Config): Server {
             switch (url.pathname) {
                 case "/":
                 case "/status":
-                    return sendJson(res, 200, { ...bridge.status(), scope: {
-                        allowGuilds: cfg.allowGuilds,
-                        denyDms: cfg.denyDms,
-                        pseudonymize: cfg.pseudonymize
-                    } });
+                    return sendJson(res, 200, {
+                        ...bridge.status(),
+                        // Only the owner ever serves HTTP, so this identifies
+                        // whoever holds the Discord socket. "Already running"
+                        // is a dead end without it — you can't stop, inspect or
+                        // take over a process you can't name.
+                        owner: { pid: process.pid, since: STARTED_AT },
+                        scope: {
+                            allowGuilds: cfg.allowGuilds,
+                            denyDms: cfg.denyDms,
+                            pseudonymize: cfg.pseudonymize
+                        }
+                    });
 
                 case "/current-view": {
                     const view = await bridge.call("current_view", { limit: clamped });

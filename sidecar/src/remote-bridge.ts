@@ -113,25 +113,90 @@ export class RemoteBridge implements Bridge {
     }
 }
 
+/** Who currently holds the Discord socket. `pid` is absent on older sidecars. */
+export interface OwnerInfo {
+    pid: number | null;
+    since: string | null;
+}
+
+/** Renders an owner for a human: "pid 29112, up since 20:58:20". */
+export function describeOwner(owner: OwnerInfo): string {
+    const who = owner.pid ? `pid ${owner.pid}` : "an unidentified process";
+    if (!owner.since) return who;
+    const at = new Date(owner.since);
+    return Number.isNaN(at.getTime()) ? who : `${who}, up since ${owner.since}`;
+}
+
 /**
- * Is someone already serving the bridge on this machine?
+ * Who is already serving the bridge on this machine, if anyone?
  *
  * Asks over HTTP rather than trying to bind, because a bound-and-released probe
- * races anything else starting at the same moment, and because a positive answer
- * here also proves the owner is one of ours and shares our token.
+ * races anything else starting at the same moment, and because an answer here
+ * also proves the owner is one of ours and shares our token.
+ *
+ * Returns the owner rather than a boolean because every interesting thing you
+ * might do about an existing owner — report it, stop it, take over from it —
+ * needs to know which process it is.
  */
-export async function findOwner(cfg: Config): Promise<boolean> {
+export async function findOwner(cfg: Config): Promise<OwnerInfo | null> {
     try {
         const res = await fetch(`http://127.0.0.1:${cfg.httpPort}/status`, {
             headers: { authorization: `Bearer ${cfg.token}` },
             signal: AbortSignal.timeout(1500)
         });
-        if (res.ok) return true;
+        if (res.ok) {
+            const body: any = await res.json().catch(() => null);
+            return { pid: body?.owner?.pid ?? null, since: body?.owner?.since ?? null };
+        }
         if (res.status === 401) {
             log.warn("something is on the http port but rejects our token; starting our own bridge");
         }
-        return false;
+        return null;
     } catch {
+        return null;
+    }
+}
+
+/**
+ * Stops the current owner so this process can take the socket.
+ *
+ * The pid comes from a service that answered on our loopback port with our
+ * token, which is the strongest identification available here — but it is still
+ * a pid read off the wire, so a failure to signal it is reported rather than
+ * retried against anything else.
+ *
+ * There is nothing to lose in the stopped process: the third-eye buffer lives in
+ * the renderer, not here, and the plugin redials whoever is listening next.
+ */
+export async function stopOwner(cfg: Config, owner: OwnerInfo): Promise<boolean> {
+    if (!owner.pid) {
+        // Only one thing produces this: a sidecar from before /status carried a
+        // pid, still running. Nothing here can name it, so say the one thing
+        // that does resolve it rather than leaving a dead end.
+        log.warn(
+            "the running sidecar does not report a pid — it predates this build. " +
+                "Stop it by hand (Task Manager, or `Stop-Process`) and start this one again."
+        );
         return false;
     }
+
+    try {
+        process.kill(owner.pid, "SIGTERM");
+    } catch (err) {
+        log.warn(`could not stop pid ${owner.pid}:`, err);
+        return false;
+    }
+
+    // Wait for it to actually stop answering. Binding the moment after the
+    // signal lands is a race the old owner usually wins.
+    for (let attempt = 0; attempt < 20; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+        if (!(await findOwner(cfg))) {
+            log.info(`stopped pid ${owner.pid}`);
+            return true;
+        }
+    }
+
+    log.warn(`pid ${owner.pid} was signalled but is still serving the bridge`);
+    return false;
 }
