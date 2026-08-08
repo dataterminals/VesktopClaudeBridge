@@ -181,16 +181,31 @@ export function loadConfig(): Config {
     const port = envPort ?? file.port ?? DEFAULT_PORT;
 
     /*
-     * Say where the port came from when it isn't the config file.
+     * Always say where the port came from — including when nothing is wrong.
      *
      * A port mismatch is the one misconfiguration with no symptom of its own:
      * both halves start cleanly, the plugin dials one number, the sidecar
      * listens on another, and the only evidence is a client that never arrives.
+     *
+     * The case that actually bit twice was worse than that. A config that
+     * exists but doesn't get read produces *no output at all*, because "no
+     * config file" is also the ordinary first run and was therefore silent.
+     * Reading the default port and reading a configured one looked identical
+     * right up until the bind failed on a port nobody had chosen. One line at
+     * startup makes those permanently distinguishable, which is worth more than
+     * the line costs.
      */
-    if (envPort != null && file.port != null && envPort !== file.port) {
-        log.warn(`VCB_PORT=${envPort} overrides "port": ${file.port} in ${CONFIG_FILE()}`);
-    } else if (fromFile != null && file.port == null) {
-        log.warn(`no "port" in ${CONFIG_FILE()} — falling back to the default ${DEFAULT_PORT}`);
+    if (envPort != null) {
+        const conflicts = file.port != null && envPort !== file.port;
+        (conflicts ? log.warn : log.info)(
+            `bridge port ${port} (VCB_PORT${conflicts ? `, overriding "port": ${file.port} in the config file` : ""})`
+        );
+    } else if (file.port != null) {
+        log.info(`bridge port ${port} (from ${CONFIG_FILE()})`);
+    } else if (fromFile != null) {
+        log.warn(`bridge port ${port} (default — ${CONFIG_FILE()} has no "port")`);
+    } else {
+        log.info(`bridge port ${port} (default — no config file was read at ${CONFIG_FILE()})`);
     }
 
     const cfg: Config = {
