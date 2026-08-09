@@ -32,6 +32,18 @@ const VERSION = "0.1.0";
 /** `--no-mcp` ran, found the bridge already served, and did nothing. Not a failure. */
 const EXIT_ALREADY_SERVED = 3;
 
+/**
+ * How long to wait before trying the http mirror again after it fails to bind.
+ *
+ * Deliberately slower than anything else in the recovery path. Nothing is
+ * waiting on this — the websocket is already served, and the only thing the
+ * mirror unblocks is a *future* sidecar discovering this one — so the cost of
+ * being late is measured in the seconds before the next session starts, while
+ * the cost of being eager is a bind attempt against a port somebody else is
+ * deliberately holding.
+ */
+const HTTP_RETRY_MS = 15_000;
+
 async function main() {
     const args = new Set(process.argv.slice(2));
 
@@ -72,17 +84,55 @@ async function main() {
             );
             return;
         }
-        try {
-            await startHttpApi(server, cfg);
-        } catch (err) {
-            // Keep the websocket regardless: being an unfindable owner still
-            // serves this process's own MCP client, and dropping the socket here
-            // would leave nobody serving Discord at all.
-            log.error(
-                `bound the bridge but could not serve http on :${cfg.httpPort}; no other sidecar will find this one`,
-                err
-            );
-        }
+
+        /*
+         * Retried for as long as it takes, and the reason is that giving up here
+         * is unrecoverable in a way losing the websocket bind is not.
+         *
+         * A process that fails this still owns Discord — `promote()` returns
+         * early on `owner` forever after — so nothing will ever call `serve()`
+         * again. The result is an owner no other sidecar can find: the next
+         * session's `findOwner()` sees nothing, its own bind loses to the
+         * websocket this process is holding, and it exits 1, which reaches the
+         * user as "Connection closed" with a perfectly healthy bridge running.
+         *
+         * `startHttpApi` already retries 5 x 300ms internally, which covers the
+         * case this is actually likely to hit — the previous owner's socket
+         * still closing during a promotion. This slower loop is for the case
+         * that outlives it: something else holding the port for seconds or
+         * minutes. It costs one bind attempt per 15s, which is cheaper than the
+         * owner-poll this process is already running.
+         */
+        let failures = 0;
+        const serveHttp = async (): Promise<void> => {
+            try {
+                await startHttpApi(server, cfg);
+                if (failures > 0) {
+                    log.info(
+                        `http on :${cfg.httpPort} came up after ${failures} failed attempt(s); other sidecars can find this one again`
+                    );
+                }
+            } catch (err) {
+                failures++;
+                // Loud once, then quiet: a port held for a long time would
+                // otherwise write the same paragraph every 15s forever. Keeping
+                // the websocket regardless is deliberate — being an unfindable
+                // owner still serves this process's own MCP client, and dropping
+                // the socket would leave nobody serving Discord at all.
+                const say = failures === 1 ? log.error : log.debug;
+                say(
+                    `bound the bridge but could not serve http on :${cfg.httpPort}; ` +
+                        `no other sidecar can find this one until that port frees (retrying every ${HTTP_RETRY_MS / 1000}s)`,
+                    err
+                );
+                const timer = setTimeout(() => void serveHttp(), HTTP_RETRY_MS);
+                // Never a reason on its own to keep the process alive: if the
+                // MCP client has gone and the websocket is closed, there is
+                // nothing left for this mirror to serve.
+                timer.unref?.();
+            }
+        };
+        await serveHttp();
     };
 
     /*

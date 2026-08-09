@@ -936,6 +936,69 @@ try {
     try { mismatch.server.closeAllConnections(); } catch { /* already gone */ }
     await new Promise(r => { mismatch.server.close(() => r()); });
 
+    console.log("\npromotion with the mirror's port squatted (an owner nobody can find must not stay that way)");
+    /*
+     * Winning the websocket and losing the http mirror used to be terminal.
+     * `attempt()` sets `owner = true` before calling `serve()`, and `serve()`
+     * swallowed the bind failure, so `promote()` returned early on `owner` for
+     * the rest of the process's life and nothing ever tried the mirror again.
+     *
+     * The state that leaves behind is the nasty one: a perfectly healthy bridge
+     * serving Discord that no other sidecar can discover, so the next session's
+     * findOwner() sees nothing, its own bind loses to this process's websocket,
+     * and it exits 1 -- surfacing as "Connection closed" with everything running.
+     *
+     * Reproduced by holding httpPort while a candidate promotes, then letting go
+     * and checking it recovers on its own rather than needing a restart.
+     */
+    for (const proc of candidates) proc.kill();
+    await new Promise(r => setTimeout(r, 1500));
+
+    /*
+     * Destroys what it accepts, for two separate reasons.
+     *
+     * It has to look like a dead owner rather than a live one, or the candidate
+     * would see something answering on httpPort and never promote at all. And a
+     * plain `createTcpServer()` here deadlocks the test: `close()` waits for
+     * open connections to end, the candidate keeps one alive between probes, and
+     * the callback never fires. Same trap the stand-in above needs
+     * `closeAllConnections()` for — net.Server has no such method, so the
+     * sockets are dropped as they arrive instead.
+     */
+    const httpHold = createTcpServer(socket => socket.destroy());
+    check("the mirror's port is held before the promotion", await grabPort(httpHold, HTTP_PORT, 10_000));
+
+    const electE = spawnCandidate("debug");
+    check(
+        "the candidate takes the websocket anyway",
+        await waitForWsOwner(30_000),
+        electE.said.slice(-400)
+    );
+    check(
+        "and says it is unfindable rather than failing quietly",
+        await waitFor(() => electE.said.includes("could not serve http"), 15_000),
+        electE.said.slice(-400)
+    );
+
+    /*
+     * The whole point: releasing the port is enough, with no restart and no
+     * second candidate.
+     *
+     * waitForPort polls at 100ms, so the budget has to clear one whole
+     * HTTP_RETRY_MS cycle in the sidecar -- 15s, or 150 attempts -- before it
+     * can possibly succeed. 400 is that with room on a loaded machine, and it
+     * costs nothing on the happy path because the loop returns the moment the
+     * mirror answers. Getting this wrong reads exactly like the bug: the first
+     * version budgeted 120 and failed a working fix.
+     */
+    await new Promise(r => { httpHold.close(() => r()); });
+    check(
+        "and picks the mirror up on its own once the port frees",
+        await waitForPort(BASE, 400),
+        electE.said.slice(-400)
+    );
+    check("and did not have to be restarted to do it", electE.exitCode === null);
+
     console.log(`\n${passed} passed, ${failures.length} failed`);
     if (failures.length) {
         console.error("\nfailures:\n" + failures.map(f => "  - " + f).join("\n"));
