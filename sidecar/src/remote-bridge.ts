@@ -110,6 +110,8 @@ export class RemoteBridge implements Bridge {
     private watch: OwnerWatch | null = null;
     private goneStreak = 0;
     private owner: OwnerInfo | null = null;
+    /** Latches the token-mismatch warning, which would otherwise repeat every poll. */
+    private warnedRejected = false;
 
     constructor(private readonly cfg: Config) {
         this.base = `http://127.0.0.1:${cfg.httpPort}`;
@@ -135,9 +137,30 @@ export class RemoteBridge implements Bridge {
     /**
      * Asks the owner how it is, and updates the miss counter either way.
      *
-     * Any HTTP response counts as alive, including a 401 — something is holding
-     * that port, and if it is not one of ours then the bind would fail anyway,
-     * so there is nothing a finer answer would let us do differently.
+     * Only a 2xx counts as an owner. This used to accept any HTTP response at
+     * all, on the reasoning that "something is holding that port, and if it is
+     * not one of ours then the bind would fail anyway" — which is simply not
+     * true, and the error is a whole port number wide. The response came from
+     * `httpPort`; the bind happens on `port`. Nothing links them, so a stranger
+     * on the mirror's port tells us nothing about whether the websocket is free.
+     *
+     * What that bought was a second way to strand a proxy forever, wearing the
+     * first one's clothes. Kill the owner and bring a new one up against a
+     * regenerated token — the token file deleted, or found too short and
+     * re-minted (see `loadToken`), or one process started with `VCB_TOKEN` set
+     * and the other not — and every probe from here gets a 401. That read as
+     * "alive", so `goneStreak` was pinned at zero, `gone()` never fired, and no
+     * promotion was ever attempted even though the websocket port was standing
+     * free the entire time. Worse, `cached` is only rewritten further down on a
+     * parseable 2xx body, so `status()` went on reporting `connected: true` and
+     * the dead owner's account — the exact stale-but-happy answer the catch
+     * below exists to avoid.
+     *
+     * `findOwner()` already had this right and refuses to call a 401 an owner.
+     * The two halves of the same question disagreed; this is the wrong half
+     * changing. Treating a non-2xx as absence costs at most one failed bind,
+     * because the bind is still the only thing that decides who owns the socket
+     * — which is the argument `OwnerProbe` makes for staying this crude.
      */
     private async probe(): Promise<OwnerProbe> {
         let res: Response;
@@ -153,8 +176,23 @@ export class RemoteBridge implements Bridge {
             return "unreachable";
         }
 
+        if (!res.ok) {
+            if (res.status === 401 && !this.warnedRejected) {
+                // Once, not every 5s: this is a standing misconfiguration rather
+                // than an event, and the promotion it now permits is the thing
+                // that will actually resolve it.
+                this.warnedRejected = true;
+                log.warn(
+                    `something is serving :${this.cfg.httpPort} but rejects our token — treating the bridge as unowned. ` +
+                        "If that is a sidecar, it is running on a different token to this one."
+                );
+            }
+            this.cached = { ...this.cached, connected: false, user: null };
+            this.noteUnreachable();
+            return "unreachable";
+        }
+
         this.noteAlive();
-        if (!res.ok) return "alive";
 
         const body: any = await res.json().catch(() => null);
         if (body) {
@@ -170,9 +208,16 @@ export class RemoteBridge implements Bridge {
         return "alive";
     }
 
-    /** An answer of any kind is the only thing that clears the miss counter. */
+    /**
+     * A 2xx from a peer sharing our token is the only thing that clears the miss
+     * counter. It used to be any answer at all, including a 401 — see `probe`
+     * for why that was its own stranding bug rather than a harmless looseness.
+     */
     private noteAlive(): void {
         this.goneStreak = 0;
+        // Cleared so a mismatch that shows up later still gets said out loud,
+        // rather than being swallowed by a latch set hours ago.
+        this.warnedRejected = false;
         if (this.confirmTimer) clearTimeout(this.confirmTimer);
         this.confirmTimer = null;
         this.watch?.alive();

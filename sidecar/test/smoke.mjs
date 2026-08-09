@@ -17,7 +17,7 @@
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
-import { createServer as createTcpServer } from "node:net";
+import { connect as tcpConnect, createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -418,6 +418,50 @@ function startStandIn(pid) {
         }));
     });
     return new Promise(resolve => server.listen(HTTP_PORT, "127.0.0.1", () => resolve(server)));
+}
+
+/**
+ * A stand-in owner that can be flipped from answering to rejecting.
+ *
+ * The token-mismatch case has no other way in: the real sidecar mints one token
+ * per config dir, so two of ours always agree, and disagreeing needs a peer that
+ * answers `/status` with a 401 while a candidate is already attached to it.
+ */
+function startRejectingStandIn(pid) {
+    let rejecting = false;
+
+    const server = createHttpServer((req, res) => {
+        if (rejecting) {
+            res.writeHead(401, { "content-type": "text/plain" });
+            return res.end("unauthorized\n");
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+            connected: false, user: null, pluginVersion: null, connectedSince: null,
+            port: WS_PORT, owner: { pid, since: new Date().toISOString() }
+        }));
+    });
+
+    return new Promise(resolve =>
+        server.listen(HTTP_PORT, "127.0.0.1", () =>
+            resolve({ server, startRejecting: () => { rejecting = true; } })
+        )
+    );
+}
+
+/** Is anything accepting connections on the websocket port yet? */
+async function waitForWsOwner(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        const held = await new Promise(resolve => {
+            const sock = tcpConnect({ port: WS_PORT, host: "127.0.0.1" });
+            sock.once("connect", () => { sock.destroy(); resolve(true); });
+            sock.once("error", () => resolve(false));
+        });
+        if (held) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise(r => setTimeout(r, 250));
+    }
 }
 
 async function waitForPort(base = BASE, attempts = 50) {
@@ -845,6 +889,52 @@ try {
         await fakePlugin();
         check("and the retry holds the websocket, not just the mirror", (await (await get("/status")).json()).connected === true);
     }
+
+    console.log("\nre-election, past a token mismatch (a 401 is not an owner)");
+    /*
+     * The second way to strand a proxy forever, which survived the first fix.
+     *
+     * `probe()` used to count any HTTP response as proof of an owner, 401
+     * included, reasoning that something held the port and "the bind would fail
+     * anyway". It would not: the answer comes from httpPort, the bind happens on
+     * port, and nothing links the two. So an owner that came back on a
+     * regenerated token pinned `goneStreak` at zero forever — no promotion was
+     * ever attempted while the websocket port stood free, and `status()` went on
+     * reporting the dead owner's account because `cached` only updates on a 2xx.
+     *
+     * Reproduced by attaching a candidate to a stand-in that answers, then
+     * flipping it to 401 and freeing the websocket. The assertion is on who ends
+     * up holding WS_PORT rather than on /status, because the stand-in keeps
+     * httpPort throughout — which is the whole point, and also why a candidate
+     * that promotes here stays invisible to /status.
+     */
+    for (const proc of candidates) proc.kill();
+    await new Promise(r => setTimeout(r, 1500));
+
+    const wsHold = createTcpServer();
+    check("the websocket port is held so the candidate has to proxy", await grabPort(wsHold, WS_PORT, 10_000));
+
+    const mismatch = await startRejectingStandIn(424242);
+    const electD = spawnCandidate("debug");
+    // Long enough to have found the stand-in, attached, and settled into polling.
+    await new Promise(r => setTimeout(r, 3000));
+
+    mismatch.startRejecting();
+    await new Promise(r => { wsHold.close(() => r()); });
+
+    /*
+     * Budget: up to 5s for the poll that sees the first 401, 750ms for the
+     * confirming probe, then the bind — which succeeds first time, because
+     * nothing holds the websocket now. 30s is that with room to spare, and
+     * before the fix no budget would have sufficed: the candidate was not
+     * counting those 401s as misses at all.
+     */
+    check("a rejected token does not count as an owner", await waitForWsOwner(30_000), electD.said.slice(-400));
+    check("and says which port is answering on the wrong token", electD.said.includes("rejects our token"));
+    check("and did not exit over it", electD.exitCode === null);
+
+    try { mismatch.server.closeAllConnections(); } catch { /* already gone */ }
+    await new Promise(r => { mismatch.server.close(() => r()); });
 
     console.log(`\n${passed} passed, ${failures.length} failed`);
     if (failures.length) {
