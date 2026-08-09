@@ -38,7 +38,22 @@ export interface Config {
     defaultLimit: number;
     /** Hard ceiling on messages per call, regardless of what was asked for. */
     maxLimit: number;
-    /** Message bodies longer than this get truncated in compact output. */
+    /**
+     * Message bodies longer than this get truncated in compact output.
+     *
+     * The default is Discord's own ceiling, not a budget: a single message caps
+     * at 2000 characters, or 4000 with Nitro, so at 4000 this can never fire on
+     * a message a human actually sent. It went in at 1200 as a token-saving
+     * guess and the cost was invisible — a long post arrived pre-cut with a
+     * "refetch this message" footer, and the refetch returned the same truncated
+     * body, because the trim happens here on the way out rather than at the
+     * fetch. Truncating the one message someone wrote at length is exactly
+     * backwards: length is usually the signal that it mattered.
+     *
+     * Lower it if a transcript is genuinely too expensive — `maxLimit` messages
+     * at 4000 is the worst case, and it is a big one — but prefer asking for
+     * fewer messages over reading all of them at half length.
+     */
     truncateAt: number;
     /**
      * IANA zone name that rendered transcripts are stamped in, e.g.
@@ -221,7 +236,7 @@ export function loadConfig(): Config {
         pseudonymize: envFlag("VCB_PSEUDONYMIZE") ?? file.pseudonymize ?? false,
         defaultLimit: envInt("VCB_DEFAULT_LIMIT") ?? file.defaultLimit ?? 50,
         maxLimit: envInt("VCB_MAX_LIMIT") ?? file.maxLimit ?? 200,
-        truncateAt: envInt("VCB_TRUNCATE_AT") ?? file.truncateAt ?? 1200,
+        truncateAt: envInt("VCB_TRUNCATE_AT") ?? file.truncateAt ?? 4000,
         timezone: resolveTimezone(process.env.VCB_TIMEZONE ?? file.timezone),
         rpcTimeoutMs: envInt("VCB_RPC_TIMEOUT_MS") ?? file.rpcTimeoutMs ?? 15_000,
         http: envFlag("VCB_HTTP") ?? file.http ?? true,
