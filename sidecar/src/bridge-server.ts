@@ -66,6 +66,17 @@ function secretsMatch(a: string, b: string): boolean {
  */
 export interface Bridge {
     status(): BridgeStatus;
+    /**
+     * Who is actually holding the Discord socket, for a human to read.
+     *
+     * `discord_status` is the tool the model is told to reach for the moment
+     * anything reports `no_client`, and without this it cannot tell "I own the
+     * socket and Discord is down" from "I am proxying to a process that died".
+     * Since a stranded proxy can now promote itself, those two are genuinely
+     * different states of the same machine, and a bug report that can't
+     * distinguish them is unfalsifiable.
+     */
+    describe(): string;
     call<M extends RpcMethod>(method: M, params: RpcParams[M]): Promise<RpcResults[M]>;
     close(): Promise<void>;
 }
@@ -226,6 +237,10 @@ export class BridgeServer extends EventEmitter implements Bridge {
 
     get connected(): boolean {
         return this.socket !== null && this.socket.readyState === 1;
+    }
+
+    describe(): string {
+        return `this process (pid ${process.pid})`;
     }
 
     status(): BridgeStatus {

@@ -10,6 +10,7 @@
  */
 
 import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
+import { copyToClipboard } from "@utils/clipboard";
 import definePlugin, { IconComponent, OptionType } from "@utils/types";
 import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
 import { ContextMenuApi, GuildStore, Menu, Toasts } from "@webpack/common";
@@ -24,7 +25,9 @@ import {
     toBridgeMessage
 } from "./discord";
 import { handlers, snapshotCurrentChannel } from "./handlers";
-import { addMark, loadMarks, markCount } from "./marked";
+import { type CopyableId, messageHome, messageIds, noun } from "./ids";
+import { addMark, clearMarks, loadMarks, markCount } from "./marked";
+import type { BridgeChannel } from "./protocol";
 import { drainTokenInbox, settings } from "./settings";
 import {
     isReading,
@@ -65,15 +68,33 @@ function notifyMarked(count: number) {
  * The surrounding messages matter: a single line lifted out of a thread is
  * usually unreadable without the two or three that set it up, and the user
  * shouldn't have to mark each one by hand.
+ *
+ * Which conversation, though, is the message's own — not the one on screen.
+ * This used to take both from `view`, and on a message that lives elsewhere (a
+ * search hit, the inline thread preview) that went wrong twice. The lookup found
+ * nothing, because a message from channel B is not in channel A's cache, so the
+ * mark silently degraded to the single message with no context at all. And what
+ * it recorded around that message — the mark's channel, its guild, the guildId
+ * stamped on the BridgeMessage — all described the channel you happened to be
+ * looking at. The sidecar then filed somebody's search hit under a channel it
+ * was never in. Meanwhile the Copy IDs row directly beneath it in the same menu
+ * resolved the same message correctly, so one context menu gave two answers.
+ *
+ * Both go through messageHome now, which is why it is exported. Pointing the
+ * cache lookup at the message's own channel also fixes the context for free: it
+ * is the channel whose cache can actually contain the neighbours.
  */
-function markMessage(rawMessage: any, rawChannel: any) {
-    const channel = toBridgeChannel(rawChannel);
-    if (!channel) return;
+function markMessage(rawMessage: any, view: BridgeChannel) {
+    const home = messageHome(rawMessage, view);
 
-    const guild = channel.guildId ? toBridgeGuild(GuildStore.getGuild(channel.guildId)) : null;
+    // Null when `raw.channel_id` isn't cached. Recording no channel is the
+    // honest answer there — the messages still carry their own channelId and
+    // permalink — and it beats reinstating the substitution above.
+    const channel = home.channel;
+    const guild = channel?.guildId ? toBridgeGuild(GuildStore.getGuild(channel.guildId)) : null;
     const span = Math.max(0, settings.store.markContext ?? 5);
 
-    const nearby = cachedMessages(channel.id, 200);
+    const nearby = cachedMessages(home.id, 200);
     const index = nearby.findIndex(m => m.id === String(rawMessage.id));
 
     const messages =
@@ -83,6 +104,127 @@ function markMessage(rawMessage: any, rawChannel: any) {
 
     addMark({ note: null, guild, channel, messages });
     notifyMarked(messages.length);
+}
+
+/**
+ * Empties the queue from inside Discord.
+ *
+ * The count is already in the menu label, so "what am I about to lose" is
+ * answered before the click and there is no confirmation modal — it would be
+ * the only modal in the plugin, and a mark costs one right-click to remake.
+ */
+function clearQueue() {
+    const cleared = clearMarks();
+    toast(
+        cleared ? `Cleared ${cleared} mark${cleared === 1 ? "" : "s"}` : "Nothing to clear",
+        cleared ? Toasts.Type.SUCCESS : Toasts.Type.MESSAGE
+    );
+    client?.notify("marked", { queued: markCount(), cleared });
+}
+
+// ---------------------------------------------------------------------------
+// Copying ids
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a channel name gets cut off in a menu row. This number is a guess.
+ *
+ * Saying so rather than implying a measurement: Discord's context-menu CSS ships
+ * inside Discord's own bundle, and nothing in the Equicord tree styles a menu
+ * item, so there was no stylesheet here to measure it against and 28 is just
+ * what looked right against a handful of real channel names. What would settle
+ * it is opening a real menu in devtools and reading the computed width and font
+ * of the label element — and the answer might well be to delete this, since if
+ * the label already elides in CSS then truncating here only makes it happen
+ * twice, earlier and with a worse breakpoint.
+ */
+const MAX_WHERE = 28;
+
+/**
+ * The try/catch is load-bearing, not decorative.
+ *
+ * This plugin ships as `dist/equibop` (scripts/install-plugin.ps1 points Vesktop
+ * at it), and every equibop bundle is built with IS_DISCORD_DESKTOP false
+ * (Equicord scripts/build/build.mjs:209) — so `copyToClipboard` resolves to
+ * `navigator.clipboard.writeText`, which genuinely rejects when the document
+ * isn't focused. That is a thing that happens to a context menu.
+ *
+ * It is awaited rather than `.then()`ed because the same source built as
+ * `dist/desktop` takes the other branch, `DiscordNative.clipboard.copy`, which
+ * is synchronous and returns undefined while being declared `Promise<void>` —
+ * `DiscordNative` is typed `any` (Equicord src/globals.d.ts:62), so nothing
+ * would flag a `.then()` chain that throws there at runtime.
+ *
+ * The failure goes to the console unconditionally and to the user only if they
+ * asked for toasts, which is the same bargain markCurrentChannel already makes.
+ */
+async function copyForClaude(text: string, said: string) {
+    try {
+        await copyToClipboard(text);
+    } catch (err: any) {
+        console.error("[VesktopClaudeBridge] clipboard write failed:", err);
+        toast(`Could not copy that: ${err?.message ?? err}`, Toasts.Type.FAILURE);
+        return;
+    }
+    toast(said, Toasts.Type.SUCCESS);
+}
+
+function idLabel(entry: CopyableId): string {
+    const kind = noun(entry);
+    const head = `${kind.charAt(0).toUpperCase()}${kind.slice(1)} ID`;
+    if (!entry.where) return head;
+    const where =
+        entry.where.length > MAX_WHERE ? `${entry.where.slice(0, MAX_WHERE - 1)}…` : entry.where;
+    return `${head} — ${where}`;
+}
+
+/** `#general` is already unambiguous; a thread or DM title needs quoting to read as a name. */
+function copiedToast(entry: CopyableId): string {
+    const kind = noun(entry);
+    if (!entry.where) return `Copied the ${kind} ID`;
+    return `Copied the ${kind} ID for ${entry.where.startsWith("#") ? entry.where : `"${entry.where}"`}`;
+}
+
+/**
+ * A submenu rather than four rows shoved into the copy group.
+ *
+ * The parent deliberately has no `action`: clicking it should open the list, not
+ * silently overwrite the clipboard with whichever id we guessed you meant. Same
+ * shape as Equicord's own gifCollections menu
+ * (src/equicordplugins/gifCollections/components/contextMenus.tsx:26), which is
+ * an action-less parent wrapping mapped items plus a separator.
+ */
+function CopyIdsItem(rawMessage: any, channel: BridgeChannel) {
+    const { ids, block } = messageIds(rawMessage, channel);
+
+    return (
+        <Menu.MenuItem id="vcb-copy-ids" key="vcb-copy-ids" label="Copy IDs for Claude">
+            <Menu.MenuItem
+                id="vcb-copy-ids-block"
+                key="vcb-copy-ids-block"
+                label="Link and IDs"
+                action={() => void copyForClaude(block, "Copied the message link and its IDs")}
+            />
+            <Menu.MenuSeparator />
+            {ids.map(entry => {
+                // Keyed on the snowflake because push() in ids.ts dedupes on it,
+                // so this is unique by construction. It used to be kind + parent,
+                // which two different channels can share — a thread home next to
+                // a different thread on screen gives two rows that are both kind
+                // "thread", parent false, and that is two React children with
+                // one key and two menu items with one id.
+                const id = `vcb-copy-${entry.id}`;
+                return (
+                    <Menu.MenuItem
+                        id={id}
+                        key={id}
+                        label={idLabel(entry)}
+                        action={() => void copyForClaude(entry.id, copiedToast(entry))}
+                    />
+                );
+            })}
+        </Menu.MenuItem>
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -192,22 +334,26 @@ const BridgeIconIdle: IconComponent = ({ height = 20, width = 20, className, chi
 
 const messageContextMenuPatch: NavContextMenuPatchCallback = (children, props: any) => {
     const message = props?.message;
-    const channel = props?.channel;
+    // Normalised once, here, so both items reason about the same channel — and
+    // so nothing downstream has to guess whether it was handed a raw record.
+    const channel = toBridgeChannel(props?.channel);
     if (!message || !channel) return;
 
-    const item = (
+    const items = [
         <Menu.MenuItem
             id="vcb-mark-for-claude"
+            key="vcb-mark-for-claude"
             label="Mark for Claude"
             action={() => markMessage(message, channel)}
-        />
-    );
+        />,
+        CopyIdsItem(message, channel)
+    ];
 
-    // Sit next to Copy Text if it's there, so it lands where a copy action is
+    // Sit next to Copy Text if it's there, so they land where a copy action is
     // expected rather than orphaned at the bottom of the menu.
     const group = findGroupChildrenByChildId("copy-text", children);
-    if (group) group.push(item);
-    else children.push(<Menu.MenuGroup>{item}</Menu.MenuGroup>);
+    if (group) group.push(...items);
+    else children.push(<Menu.MenuGroup>{items}</Menu.MenuGroup>);
 };
 
 /**
@@ -218,6 +364,7 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, props: a
 function BridgeMenu() {
     const watching = isWatching();
     const st = thirdEyeState();
+    const queued = markCount();
 
     return (
         <Menu.Menu
@@ -230,6 +377,23 @@ function BridgeMenu() {
                 label={`Mark the last ${settings.store.grabCount ?? 50} messages`}
                 action={() => void markCurrentChannel()}
             />
+            {/*
+              * Hidden at zero rather than disabled. The disabled precedent below
+              * is a *status* line, which is worth stating even when it reads
+              * nothing; "Clear the queue (0 marked)" is just a dead control in a
+              * four-item menu, and the count is the label's whole job.
+              *
+              * It sits with the marking item, above the separator, so mark
+              * actions are one group and third eye stays its own.
+              */}
+            {queued > 0 && (
+                <Menu.MenuItem
+                    id="vcb-clear-marks"
+                    label={`Clear the queue (${queued} marked)`}
+                    color="danger"
+                    action={() => clearQueue()}
+                />
+            )}
             <Menu.MenuSeparator />
             <Menu.MenuCheckboxItem
                 id="vcb-third-eye"
@@ -259,8 +423,15 @@ const GrabChannelButton: ChatBarButtonFactory = ({ isMainChat }) => {
     // the icon itself distinguishes "capturing, costing nothing" from "being read".
     const Icon = isReading() ? BridgeIcon : BridgeIconIdle;
 
+    // The queue count only shows up on the idle branch: the watching branches
+    // already spend the tooltip on buffer numbers, and a third counter there
+    // reads as noise rather than as information.
+    const queued = markCount();
+
     const tooltip = !st.watching
-        ? `Claude bridge — mark messages, or start third eye`
+        ? queued > 0
+            ? `Claude bridge — ${queued} marked · mark more, or start third eye`
+            : "Claude bridge — mark messages, or start third eye"
         : here
           ? `Third eye: armed · ${st.pending} buffered · ${st.notablePending} for you`
           : `Third eye: armed on #${st.channel?.name ?? "?"} · ${st.pending} buffered`;

@@ -74,6 +74,12 @@ export const settings = definePluginSettings({
             "How many surrounding messages to include when you mark a single message. 0 marks just that one.",
         default: 5
     },
+    markExpiryHours: {
+        type: OptionType.NUMBER,
+        description:
+            "How long a mark stays in the queue. Marks older than this drop out on their own, so asking Claude to read \"what I marked\" today can't quietly hand it something from days ago. 0 keeps them forever.",
+        default: 48
+    },
     showToasts: {
         type: OptionType.BOOLEAN,
         description: "Show a toast when something is marked or when the bridge connects.",

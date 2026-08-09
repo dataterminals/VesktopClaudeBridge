@@ -45,6 +45,15 @@ import type {
 const DM_CHANNEL_TYPES = new Set([1, 3]);
 const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
 
+/**
+ * Forum (15) and media (16) channels.
+ *
+ * They hold threads rather than messages, so the id of one is not something
+ * `history` can read — which is why the copy-ids menu labels a forum parent
+ * differently from a channel parent instead of calling both "channel".
+ */
+const FORUM_CHANNEL_TYPES = new Set([15, 16]);
+
 const TEXTUAL_EXTENSIONS = new Set([
     "log", "txt", "json", "yml", "yaml", "md", "ini", "cfg", "conf", "csv", "tsv",
     "diff", "patch", "lua", "ts", "tsx", "js", "jsx", "py", "cs", "cpp", "cc", "h",
@@ -174,6 +183,32 @@ function dmLabel(channel: any): string {
     return names.length ? `dm:${names.join(",")}` : "dm";
 }
 
+/** Looks a channel up by id. Uncached ids come back undefined, so this is null-safe both ways. */
+export function channelById(id: string | null | undefined): BridgeChannel | null {
+    if (!id) return null;
+    return toBridgeChannel(ChannelStore.getChannel(id));
+}
+
+/** A forum or media channel: a container of threads, with no messages of its own. */
+export function isForum(channel: BridgeChannel): boolean {
+    return FORUM_CHANNEL_TYPES.has(channel.type);
+}
+
+/**
+ * The channel a thread hangs off, or null if this isn't a thread.
+ *
+ * The isThread gate is the entire point of the function. `parent_id` is
+ * populated for ordinary guild channels too, where it holds the *category* they
+ * are filed under — and a category has nothing in it to read, which is why
+ * listChannels already drops type 4. An ungated version would hand back a
+ * category id under the label "parent channel", and the only way to find out
+ * would be to watch `history` fail on it.
+ */
+export function parentChannel(channel: BridgeChannel): BridgeChannel | null {
+    if (!channel.isThread) return null;
+    return channelById(channel.parentId);
+}
+
 function toAttachment(raw: any): BridgeAttachment {
     const filename = raw?.filename ?? "attachment";
     const contentType = raw?.content_type ?? raw?.contentType ?? null;
@@ -246,9 +281,13 @@ function toReplyRef(raw: any, channelId: string, guildId: string | null): Bridge
 export function toBridgeMessage(raw: any, channel: BridgeChannel | null): BridgeMessage {
     const channelId = String(raw?.channel_id ?? channel?.id ?? "0");
     const guildId = channel?.guildId ?? null;
+    // One id for both fields. They used to disagree — `id` fell back to "0"
+    // while the link template interpolated the bare `raw?.id`, so a message
+    // without one produced a permalink ending in /undefined.
+    const id = String(raw?.id ?? "0");
 
     return {
-        id: String(raw?.id ?? "0"),
+        id,
         channelId,
         guildId,
         author: toBridgeUser(raw?.author, guildId),
@@ -260,7 +299,7 @@ export function toBridgeMessage(raw: any, channel: BridgeChannel | null): Bridge
         embeds: Array.isArray(raw?.embeds) ? raw.embeds.map(toEmbed) : [],
         reactions: Array.isArray(raw?.reactions) ? raw.reactions.map(toReaction) : [],
         pinned: Boolean(raw?.pinned),
-        link: `https://discord.com/channels/${guildId ?? "@me"}/${channelId}/${raw?.id}`
+        link: messageLink(guildId, channelId, id)
     };
 }
 
@@ -541,6 +580,16 @@ export function listChannels(guildId: string): BridgeChannel[] {
     }
 
     return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Builds the permalink Discord's own "Copy Message Link" produces.
+ *
+ * Sited next to parseMessageLink, which is its inverse, so the two cannot drift:
+ * every link this hands out is one `resolve_link` can read straight back.
+ */
+export function messageLink(guildId: string | null, channelId: string, messageId: string): string {
+    return `https://discord.com/channels/${guildId ?? "@me"}/${channelId}/${messageId}`;
 }
 
 /** Parses a discord.com/channels/<guild|@me>/<channel>/<message> link. */

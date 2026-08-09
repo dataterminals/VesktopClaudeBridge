@@ -25,7 +25,9 @@ import {
     renderTranscript,
     zoneNote
 } from "./format.js";
+import { readLive } from "./live.js";
 import { log } from "./log.js";
+import { readMarks } from "./marks.js";
 import type { BridgeMessage } from "./protocol.js";
 
 type TextResult = {
@@ -81,6 +83,11 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
             return text(
                 [
                     `connected: ${s.connected}`,
+                    // Which process holds the socket. Since a stranded sidecar
+                    // can now take the bridge over on its own, "I own it and
+                    // Discord is down" and "I am proxying to a corpse" are two
+                    // different states that otherwise look identical from here.
+                    `held by:   ${bridge.describe()}`,
                     `account:   ${s.user ? `${s.user.displayName} (@${s.user.username})` : "unknown"}`,
                     `plugin:    ${s.pluginVersion ?? "n/a"}`,
                     `since:     ${s.connectedSince ?? "n/a"}`,
@@ -133,24 +140,71 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                 consume: z
                     .boolean()
                     .optional()
-                    .describe("Clear the queue after reading it, so the same messages aren't picked up again later."),
+                    .describe("Clear the queue after reading it, so the same messages aren't picked up again later. Prefer true once you have actually acted on them."),
                 ids: z.boolean().optional().describe("Tag every message with its id.")
             }
         },
         async ({ consume, ids }): Promise<TextResult> => {
             try {
-                const { items } = await bridge.call("marked.list", { consume: consume ?? false });
-                if (items.length === 0) {
+                const out = await readMarks(bridge, cfg, pseudo, {
+                    consume: consume ?? false,
+                    ids: ids ?? false
+                });
+                if (out.items.length === 0) {
+                    // "Nothing is marked" can no longer distinguish never-marked
+                    // from expired, so it hedges rather than claiming either: the
+                    // plugin drops stale marks on its own and nothing here can
+                    // tell whether it did.
                     return text(
-                        "Nothing is marked. Ask the user to right-click a message in Discord and pick \"Mark for Claude\", or use the chat-bar button to grab the last N messages."
+                        "Nothing is marked. Ask the user to right-click a message in Discord and pick \"Mark for Claude\", or use the chat-bar button to grab the last N messages. Marks also drop out on their own once they go stale, so something marked a while ago may already have expired."
                     );
                 }
-                const blocks = items.map(item => {
-                    assertAllowed(cfg, item.channel);
-                    const head = `### mark ${item.markId} · ${item.markedAt}${item.note ? ` · note: ${item.note}` : ""}`;
-                    return `${head}\n${transcript(item.guild, item.channel, item.messages, ids)}`;
-                });
-                return text(blocks.join("\n\n"));
+                return text(out.text);
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_clear_marks",
+        {
+            title: "Empty the mark queue",
+            description:
+                "Throw away what the user marked in Discord. Use it when they say they are done with what they marked, when they ask you to clear the queue, or after you have acted on marks and do not want them coming back on the next read. Pass `markId` to drop a single mark and leave the rest. This deletes nothing in Discord — it only empties the queue the bridge keeps.",
+            inputSchema: {
+                markId: z
+                    .number()
+                    .int()
+                    .optional()
+                    .describe("Drop just this one mark — the number in its `### mark N` header. Omit to empty the whole queue.")
+            },
+            // Spelled out because this is the first tool here that changes the
+            // user's state rather than reading it.
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true }
+        },
+        async ({ markId }): Promise<TextResult> => {
+            try {
+                // Deliberately not scope-guarded: clearing returns a count and no
+                // content, so destroying is not disclosing — and guarding it would
+                // make a DM mark permanently unclearable under denyDms, which is
+                // exactly the dead end this tool exists to open up.
+                const { cleared } = await bridge.call(
+                    "marked.clear",
+                    markId === undefined ? {} : { markId }
+                );
+                if (markId === undefined) {
+                    return text(
+                        cleared
+                            ? `Cleared ${cleared} mark${cleared === 1 ? "" : "s"}. The queue is empty.`
+                            : "The mark queue was already empty."
+                    );
+                }
+                return text(
+                    cleared
+                        ? `Cleared mark ${markId}.`
+                        : `No mark ${markId} in the queue — it may already have been read with consume=true, cleared, or expired.`
+                );
             } catch (err) {
                 return failure(err);
             }
@@ -212,7 +266,14 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
         },
         async ({ notableOnly, consume, limit, ids }): Promise<TextResult> => {
             try {
-                const res = await bridge.call("third_eye.drain", {
+                /*
+                 * Guarded before the drain rather than after it — see live.ts.
+                 * This tool defaults `consume` to false, so it never had the
+                 * HTTP mirror's default data loss, but `consume: true` on an
+                 * out-of-scope channel emptied the buffer and *then* refused to
+                 * show it, which is the same defect wearing an opt-in.
+                 */
+                const res = await readLive(bridge, cfg, {
                     notableOnly: notableOnly ?? false,
                     consume: consume ?? false,
                     limit: limit ?? 100
@@ -224,10 +285,6 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                         "Third eye isn't running. The user turns it on from the chat-bar button in Discord — it captures quietly and costs nothing until this tool reads it."
                     );
                 }
-
-                // The plugin already refuses to watch DMs, but the guard is
-                // cheap and this is the boundary where content becomes context.
-                assertAllowed(cfg, st.channel);
 
                 const where = st.channel ? `#${st.channel.name}` : "(unknown channel)";
                 const head = [

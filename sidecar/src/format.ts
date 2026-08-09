@@ -16,7 +16,7 @@
 
 import type { Config } from "./config.js";
 import { BridgeError } from "./bridge-server.js";
-import type { BridgeChannel, BridgeGuild, BridgeMessage, SearchHit } from "./protocol.js";
+import type { BridgeChannel, BridgeGuild, BridgeMessage, MarkedItem, SearchHit } from "./protocol.js";
 
 const CHANNEL_TYPES: Record<number, string> = {
     0: "text",
@@ -292,6 +292,146 @@ export function renderTranscript(
     const header = compactHeader(guild, channel, messages, opts);
     if (messages.length === 0) return header;
     return `${header}\n\n${compactMessages(messages, opts)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Mark ages
+// ---------------------------------------------------------------------------
+
+/*
+ * The bug these exist for: the user marked a few things on Monday, asked about
+ * something else on Wednesday, and got Monday's marks blended into the answer
+ * with nothing in the output to suggest they were old. The header printed
+ * `markedAt` as a raw UTC ISO stamp, which is exactly the kind of thing a reader
+ * skims past.
+ *
+ * So the age comes first, in words, and anything that isn't from the current
+ * working day gets called out. The plugin also expires marks on its own, but the
+ * two measures are deliberately different and never conflict: the plugin drops
+ * marks at a hard cap, this only annotates. A soft signal at "not today" and a
+ * hard cap days later means the model can still see yesterday's mark and reason
+ * about it, rather than a queue that silently emptied itself overnight.
+ */
+
+/**
+ * Older than this and a mark is called out even if it is still the same local
+ * day. The calendar-day test alone would let a 00:30 mark read at 23:00 pass as
+ * current, which is the one case where "today" is a lie.
+ */
+const STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+
+export interface MarkAge {
+    /** Milliseconds old, or null when `markedAt` could not be parsed. */
+    ms: number | null;
+    /** "just now", "19 hours ago", "unknown age" — what actually gets printed. */
+    label: string;
+    stale: boolean;
+}
+
+/** The local calendar date of an instant, as `YYYY-MM-DD`, in a named zone. */
+function localDay(timezone: string, at: Date): string {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    });
+    const part: Record<string, string> = {};
+    // Reassembled by name rather than trusting a locale to emit the parts in
+    // ISO order — same reasoning as `stamper()` above.
+    for (const { type, value } of fmt.formatToParts(at)) part[type] = value;
+    return `${part.year}-${part.month}-${part.day}`;
+}
+
+function plural(n: number, unit: string): string {
+    return `${n} ${unit}${n === 1 ? "" : "s"} ago`;
+}
+
+/**
+ * How old a mark is, in the words a reader actually wants.
+ *
+ * `now` is injectable so the buckets can be tested directly against a fixed
+ * instant; every caller in the sidecar leaves it alone.
+ *
+ * An unparseable stamp is reported as `unknown age` and treated as stale rather
+ * than dropped. Binning what the user marked over a `Date.parse` quirk is the
+ * wrong failure, and calling it stale errs in the safe direction — it gets
+ * flagged, not hidden.
+ */
+export function markAge(markedAt: string, timezone: string, now: number = Date.now()): MarkAge {
+    const at = new Date(markedAt);
+    if (Number.isNaN(at.getTime())) return { ms: null, label: "unknown age", stale: true };
+
+    // Clamped at zero: a mark stamped slightly in the future is clock skew
+    // between two machines' clocks, not a message from the future.
+    const ms = Math.max(0, now - at.getTime());
+
+    let label: string;
+    if (ms < 60_000) label = "just now";
+    else if (ms < 90 * 60_000) label = plural(Math.round(ms / 60_000), "minute");
+    else if (ms < 36 * 3_600_000) label = plural(Math.round(ms / 3_600_000), "hour");
+    else label = plural(Math.round(ms / 86_400_000), "day");
+
+    const differentDay = localDay(timezone, at) !== localDay(timezone, new Date(now));
+    return { ms, label, stale: ms >= STALE_AFTER_MS || differentDay };
+}
+
+/**
+ * The `### mark N` line.
+ *
+ * Relative age first, because that is what changes how the block underneath
+ * should be read; the absolute stamp second, in the configured zone, because
+ * that is what you cross-reference against the Discord client sitting next to
+ * you. This is also the last place in the sidecar that used to publish a raw
+ * UTC ISO string straight out of the plugin.
+ */
+export function renderMarkHeader(item: MarkedItem, timezone: string, now?: number): string {
+    const age = markAge(item.markedAt, timezone, now);
+    const when = stamper(timezone)(item.markedAt, "datetime");
+    const flag = age.stale ? "⚠ " : "";
+    const note = item.note ? ` · note: ${item.note}` : "";
+    return `### mark ${item.markId} · ${flag}${age.label} · ${when}${note}`;
+}
+
+/**
+ * The preamble above a queue of marks.
+ *
+ * The second line only appears when something is actually stale, because a
+ * warning that prints every time is a warning nobody reads. It names
+ * `consume=true` because that is the specific thing that stops the same old
+ * marks coming back on the next read.
+ */
+export function markQueueNote(items: MarkedItem[], timezone: string, now?: number): string {
+    if (!items.length) return "";
+
+    const ages = items.map(i => markAge(i.markedAt, timezone, now));
+    // An unknown age sorts as the oldest thing in the queue: it is the entry we
+    // are least able to vouch for, so it should not be able to hide behind a
+    // fresh one. Reduced rather than indexed — `noUncheckedIndexedAccess` is on.
+    const rank = (a: MarkAge) => a.ms ?? Number.POSITIVE_INFINITY;
+    const newest = ages.reduce((a, b) => (rank(b) < rank(a) ? b : a));
+    const oldest = ages.reduce((a, b) => (rank(b) > rank(a) ? b : a));
+
+    const span =
+        items.length === 1
+            ? newest.label
+            : `newest ${newest.label}, oldest ${oldest.label}`;
+    const lines = [`── ${items.length} mark${items.length === 1 ? "" : "s"} · ${span}`];
+
+    const stale = ages.filter(a => a.stale).length;
+    if (stale) {
+        const which =
+            items.length === 1
+                ? "This mark is not from the current session"
+                : `${stale} of these ${stale === 1 ? "is" : "are"} not from the current session`;
+        lines.push(
+            `── ${which} — marked before today, or hours ago — and may not be what the user is asking about now. ` +
+                "Say which marks you used. If you have acted on them, call this tool again with consume=true, " +
+                "or tell the user they can clear the queue from the chat-bar menu in Discord."
+        );
+    }
+
+    return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------

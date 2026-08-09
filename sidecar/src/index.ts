@@ -13,12 +13,19 @@
  * of Discord, so everything that wants that view has to share a connection to it.
  */
 
-import { BridgeServer, type Bridge } from "./bridge-server.js";
+import { BridgeHolder, bindBridge, type Serve } from "./bridge-holder.js";
 import { ensureConfigFile, loadConfig } from "./config.js";
 import { startHttpApi } from "./http-api.js";
 import { log, setLogLevel } from "./log.js";
 import { createMcpServer, serveMcpOverStdio } from "./mcp.js";
-import { RemoteBridge, describeOwner, findOwner, stopOwner } from "./remote-bridge.js";
+import {
+    RemoteBridge,
+    describeOwner,
+    findOwner,
+    stopOwner,
+    waitForOwner,
+    type OwnerInfo
+} from "./remote-bridge.js";
 
 const VERSION = "0.1.0";
 
@@ -44,14 +51,46 @@ async function main() {
     log.info(`downloads: ${cfg.downloadDir}`);
 
     /*
+     * Everything between "we hold the socket" and "other processes can find us".
+     *
+     * Defined once and handed to the holder, because a sidecar that promotes
+     * itself has to do exactly this too — and a promoted owner that skipped the
+     * HTTP mirror would be invisible to the next session, which would start its
+     * own bridge, fail to bind, and break the find-the-owner mechanism outright.
+     * Same function, so the startup path and the promotion path cannot drift.
+     */
+    const serve: Serve = async server => {
+        server.on("plugin-event", (event: string) => {
+            // Marks are pulled, not pushed — MCP has no way to wake the model up.
+            // This is just so `--log-level debug` shows you the user clicked.
+            log.debug(`plugin event: ${event}`);
+        });
+
+        if (!cfg.http) {
+            log.warn(
+                "http is disabled, so nothing else can find this bridge — the next Claude session will not be able to start one"
+            );
+            return;
+        }
+        try {
+            await startHttpApi(server, cfg);
+        } catch (err) {
+            // Keep the websocket regardless: being an unfindable owner still
+            // serves this process's own MCP client, and dropping the socket here
+            // would leave nobody serving Discord at all.
+            log.error(
+                `bound the bridge but could not serve http on :${cfg.httpPort}; no other sidecar will find this one`,
+                err
+            );
+        }
+    };
+
+    /*
      * The plugin dials exactly one socket, so exactly one process can own it —
      * but Claude Code and Claude Desktop each spawn their own sidecar. Whoever
      * gets here first owns the Discord connection and serves everyone else;
      * the rest proxy through it rather than dying on the port.
      */
-    let bridge: Bridge;
-    let owner = false;
-
     let existing = await findOwner(cfg);
 
     /*
@@ -66,24 +105,53 @@ async function main() {
         else log.warn("takeover failed; proxying through the existing owner instead");
     }
 
-    if (existing) {
+    /*
+     * Becoming a proxy, from either of the two ways you can get here: finding an
+     * owner up front, or losing the bind to one that started in the same instant.
+     *
+     * `gone` is what makes the bridge self-heal. Before it existed, the death of
+     * the owner stranded this process for good — every call reported that the
+     * owner had stopped answering, and the only fix was restarting every
+     * session's sidecar by hand.
+     */
+    const startProxy = async (owner: OwnerInfo): Promise<BridgeHolder> => {
         const remote = new RemoteBridge(cfg);
-        await remote.attach();
-        bridge = remote;
-        log.info(`the bridge on :${cfg.port} is held by ${describeOwner(existing)}; proxying through :${cfg.httpPort}`);
-    } else {
-        const server = new BridgeServer(cfg, VERSION);
-        await server.listen();
-        bridge = server;
-        owner = true;
-
-        if (cfg.http) startHttpApi(server, cfg);
-
-        server.on("plugin-event", (event: string) => {
-            // Marks are pulled, not pushed — MCP has no way to wake the model up.
-            // This is just so `--log-level debug` shows you the user clicked.
-            log.debug(`plugin event: ${event}`);
+        const holder = BridgeHolder.proxying(remote, cfg, VERSION, serve);
+        await remote.attach({
+            gone: () => void holder.promote(),
+            alive: () => holder.ownerAnswered()
         });
+        log.info(`the bridge on :${cfg.port} is held by ${describeOwner(owner)}; proxying through :${cfg.httpPort}`);
+        return holder;
+    };
+
+    let holder: BridgeHolder;
+
+    if (existing) {
+        holder = await startProxy(existing);
+    } else {
+        const server = await bindBridge(cfg, VERSION);
+        if (server) {
+            holder = BridgeHolder.owning(server, cfg, VERSION, serve);
+            await serve(server);
+        } else {
+            /*
+             * We and another sidecar started in the same instant and it won the
+             * bind — `findOwner()` ran before either of us was listening. Before
+             * this branch existed that rejection reached main().catch and became
+             * process.exit(1), which an MCP host renders as "Connection closed":
+             * the exact symptom remote-bridge.ts was written to eliminate.
+             */
+            const winner = await waitForOwner(cfg);
+            if (!winner) {
+                log.error(
+                    `something bound ws://127.0.0.1:${cfg.port} but nothing answers on :${cfg.httpPort}; this process has nothing to serve`
+                );
+                process.exitCode = 1;
+                return;
+            }
+            holder = await startProxy(winner);
+        }
     }
 
     if (args.has("--no-mcp")) {
@@ -94,14 +162,14 @@ async function main() {
          * up, just not ours — but exiting 0 in silence reads as a crash to
          * anyone who got here by double-clicking a launcher. Say which it is.
          */
-        if (!owner) {
-            log.info(`the bridge on :${cfg.port} is already up and being served by ${describeOwner(existing!)}`);
+        if (!holder.isOwner) {
+            log.info(`the bridge on :${cfg.port} is already up and being served by ${holder.describe()}`);
             log.info(
                 args.has("--takeover")
                     ? "the takeover did not succeed, so this process is standing down"
                     : "nothing for this process to do — re-run with --takeover to serve it here instead"
             );
-            await bridge.close();
+            await holder.close();
             // Distinct from both success and failure: nothing went wrong, but
             // nothing was served either. The launcher branches on this to offer
             // taking over rather than reporting a stop that never started.
@@ -110,13 +178,16 @@ async function main() {
         }
         log.info("running without MCP (bridge + http only)");
     } else {
-        const mcp = createMcpServer(bridge, cfg, VERSION);
+        // The holder, not the bridge inside it: if this process ever promotes
+        // itself, every tool has to end up talking to the new BridgeServer
+        // without knowing anything happened.
+        const mcp = createMcpServer(holder, cfg, VERSION);
         await serveMcpOverStdio(mcp);
     }
 
     const shutdown = async (signal: string) => {
         log.info(`${signal} — shutting down`);
-        await bridge.close();
+        await holder.close();
         process.exit(0);
     };
     process.on("SIGINT", () => void shutdown("SIGINT"));
