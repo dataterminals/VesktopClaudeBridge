@@ -46,18 +46,35 @@ if (-not (Test-Path (Join-Path $EquicordPath "src"))) {
 function Invoke-Pnpm {
     param([Parameter(Mandatory = $true)][string[]] $PnpmArgs)
 
-    & pnpm @PnpmArgs
-    if ($LASTEXITCODE -eq 0) { return }
+    # CI=true stops pnpm asking questions nobody is there to answer. Without it,
+    # a node_modules that is merely out of sync with the lockfile makes pnpm
+    # prompt "would you like to run pnpm install?", and a non-interactive console
+    # answers EOF - at which point pnpm gives up and exits 0. A build that never
+    # ran, reported as success. That is exactly how this script once wrote fresh
+    # aliases over a week-old bundle and printed "Built."
+    $previousCi = $env:CI
+    $env:CI = "true"
+    try {
+        & pnpm @PnpmArgs
+        if ($LASTEXITCODE -eq 0) { return }
 
-    # pnpm tries to self-switch to the version pinned in package.json#packageManager,
-    # which fails on some setups. Fall back to whatever pnpm is on PATH.
-    Write-Host "pnpm failed; retrying without packageManager self-switching..." -ForegroundColor Yellow
-    & pnpm --config.manage-package-manager-versions=false @PnpmArgs
-    if ($LASTEXITCODE -ne 0) { throw "pnpm $($PnpmArgs -join ' ') failed" }
+        # pnpm tries to self-switch to the version pinned in package.json#packageManager,
+        # which fails on some setups. Fall back to whatever pnpm is on PATH.
+        Write-Host "pnpm failed; retrying without packageManager self-switching..." -ForegroundColor Yellow
+        & pnpm --config.manage-package-manager-versions=false @PnpmArgs
+        if ($LASTEXITCODE -ne 0) { throw "pnpm $($PnpmArgs -join ' ') failed" }
+    } finally {
+        $env:CI = $previousCi
+    }
 }
 
 function Set-VesktopAliases {
-    param([Parameter(Mandatory = $true)][string] $DistDir)
+    param(
+        [Parameter(Mandatory = $true)][string] $DistDir,
+        # Stamped just before the build ran. Anything older than this was not
+        # produced by it - see the staleness check below.
+        [Parameter(Mandatory = $true)][datetime] $NewerThan
+    )
 
     # Vesktop validates a custom Vencord Location by looking for Vencord's release
     # asset names (isValidVencordInstall in src/main/utils/vencordLoader.ts) and
@@ -88,6 +105,21 @@ function Set-VesktopAliases {
         if (-not (Test-Path $from)) {
             throw "Expected '$from' after the build but it isn't there. Did the Equicord build layout change?"
         }
+
+        # The build claimed to succeed, so this file must have just been written.
+        # Checking existence alone is what let a silent build failure through
+        # once already: pnpm bailed on a prompt and exited 0, every file was
+        # still sitting there from a build a week earlier, and this function
+        # copied that week-old bundle onto the alias names and reported success.
+        # The user then restarts Vesktop into the old plugin with nothing
+        # anywhere admitting why nothing changed. An mtime is a weak check, but
+        # it is exactly strong enough for "did the thing that just ran write
+        # this", which is the only question being asked.
+        $written = (Get-Item $from).LastWriteTime
+        if ($written -lt $NewerThan) {
+            throw "'$from' was last written $written, before the build started $NewerThan - so the build did not actually produce it. Something failed quietly; re-run and read the pnpm output above."
+        }
+
         Copy-Item $from -Destination (Join-Path $DistDir $aliases[$real]) -Force
         Write-Host "  $real -> $($aliases[$real])"
     }
@@ -119,13 +151,20 @@ Get-ChildItem -Path $source -File | Where-Object { $_.Extension -in ".ts", ".tsx
 Write-Host "Installed to $target" -ForegroundColor Green
 
 if ($Build) {
+    # Stamped before anything runs, and backdated a couple of seconds because
+    # filesystem and clock granularity do not have to agree - a file written in
+    # the same second the build started must not read as older than it.
+    $buildStarted = (Get-Date).AddSeconds(-2)
+
     Push-Location $EquicordPath
     try {
-        # A fresh clone has no node_modules, and `pnpm build` fails confusingly without them.
-        if (-not (Test-Path (Join-Path $EquicordPath "node_modules"))) {
-            Write-Host "No node_modules yet; installing Equicord deps..." -ForegroundColor Cyan
-            Invoke-Pnpm install
-        }
+        # An out-of-sync node_modules is enough to make `pnpm build` stop and ask
+        # a question, so this runs unconditionally rather than only on a fresh
+        # clone. It is a no-op ("Already up to date") when the lockfile matches,
+        # and the alternative is the failure mode this script is now guarded
+        # against: a prompt nobody answers, an exit code of 0, and no build.
+        Write-Host "Syncing Equicord deps..." -ForegroundColor Cyan
+        Invoke-Pnpm install
 
         Write-Host "Building Equicord..." -ForegroundColor Cyan
         Invoke-Pnpm build
@@ -135,7 +174,7 @@ if ($Build) {
 
     $distDir = Join-Path $EquicordPath "dist\equibop"
     Write-Host "Writing Vesktop aliases..." -ForegroundColor Cyan
-    Set-VesktopAliases -DistDir $distDir
+    Set-VesktopAliases -DistDir $distDir -NewerThan $buildStarted
 
     Write-Host ""
     Write-Host "Built. Point Vesktop's Vencord Location at:" -ForegroundColor Green
