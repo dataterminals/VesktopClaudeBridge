@@ -169,10 +169,34 @@ export interface ThirdEyeState {
     /** When the watch started, and when it will lapse on its own. */
     since: string | null;
     expiresAt: string | null;
+    /**
+     * The channel's newest message at the moment the watch armed.
+     *
+     * The buffer starts empty, so everything in it is *after* this id and
+     * nothing before it was ever captured. Naming that edge is what makes the
+     * run-up recoverable — `history before=<anchorId>` reads what led up to the
+     * first buffered message — on the same principle as a truncation note.
+     */
+    anchorId: string | null;
+    /**
+     * Set when a Discord reload restored this watch, cleared by the first
+     * consuming drain.
+     *
+     * Only the intent survives a Ctrl+R; whatever was buffered does not. Without
+     * this the restored state reads `0 buffered, 0 dropped`, which is
+     * indistinguishable from a quiet channel — when what actually happened is
+     * that everything unread was discarded.
+     */
+    resumedAt: string | null;
     /** Buffered but not yet drained. */
     pending: number;
     notablePending: number;
-    /** Lifetime counters, so "is this a firehose?" is measured, not guessed. */
+    /**
+     * Volume counters for the current watch, so "is this a firehose?" is
+     * measured rather than guessed. Reset by `start()`, because they are
+     * rendered as "since it started" and a watch moved from a busy channel to a
+     * quiet one would otherwise report the busy one's traffic forever.
+     */
     seen: number;
     matched: number;
     /** Messages the ring evicted before anything read them. */
@@ -269,6 +293,15 @@ export interface RpcResults {
          * the same principle as truncation: a gap you know about is recoverable.
          */
         dropped: number;
+        /**
+         * `resumedAt` as it stood *before* this drain cleared it.
+         *
+         * Carried beside `dropped` for the same reason that one is: `state`
+         * describes the buffer after the drain, but both of these are facts
+         * about the gap this particular drain is reporting, and a consuming
+         * read would otherwise clear the flag before anyone saw it.
+         */
+        resumed: string | null;
     };
     guilds: { guilds: BridgeGuild[]; };
     channels: { channels: BridgeChannel[]; };

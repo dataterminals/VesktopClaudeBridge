@@ -34,6 +34,8 @@ A client-mode process with `--no-mcp` exits immediately, which is correct — it
 
 **Truncation is recoverable.** Long bodies get cut with a note naming the tool and argument that would fetch the rest, rather than silently ending.
 
+**Every edge is named, and free context is recovered before anything is fetched.** A rendered block should never imply coverage it doesn't have, so anything cut, evicted, unresolved, or not-yet-captured says so and names the call that would close it — truncation, `dropped`, `resumedAt`, `anchorId` and unresolved replies are all the same rule. The other half is that a gap answerable from the page already in hand is closed for free rather than reported: `compactMessages` joins unresolved replies against the messages it was handed before rendering them. Nothing fetches on its own. Spending a round trip is the reader's decision, and a formatter that quietly made it would be spending the user's tokens to answer a question nobody asked.
+
 ## Search
 
 `history` reads a channel in order; `search` asks Discord's index a question. Paging `history` backwards to find an old message is O(the whole channel) and runs out of context long before it arrives, which is why this exists.
@@ -71,6 +73,24 @@ A watcher on one channel, toggled from the chat-bar menu. The buffer lives in th
 Three things follow. Denied content never crosses the process boundary, so `denyDms` means "never left the renderer" rather than "refused on arrival". The drain is a pull like `marked.list`, so sidecar restarts cost nothing. And the sidecar's added state is small enough to need no new config keys.
 
 **Capture is free; reading is the only part that costs.** No model, no tokens, no session is involved in filling the buffer, so it keeps everything and the filtering happens at the boundary where tokens would actually be spent. Measured on a real channel: 100 messages renders to ~3,900 tokens, so a `notableOnly` read is roughly 15× cheaper than draining the window. That ratio is what makes leaving it armed all day free in practice rather than only in theory.
+
+### Where the buffer begins
+
+The ring starts empty and only fills forward, so a drained transcript begins where the button was pressed rather than where the conversation did. Nothing inside the transcript reveals that: arm it mid-argument and a reader gets the second half with no sign there was a first, and confidently reasons about a fragment.
+
+So `start()` records the channel's newest message id as an `anchorId`, and every render names it. That's a pointer, not a fetch — `history before=<anchorId>` reads the run-up when the conversation doesn't stand on its own, and the decision to spend that round trip stays with the reader.
+
+Deliberately not backfilled into the ring. Seeding it would put a REST page behind a button press, which breaks the claim that arming costs nothing, and would decide on the user's behalf how much run-up was worth paying for. The anchor moves that choice to the point where tokens are actually spent, which is where every other decision in this feature already lives.
+
+The anchor comes from the client cache, never REST, because you can only arm this on the channel you have open — so the cache is warm by definition and `start()` stays synchronous and free. A cold cache means no anchor, which says less rather than lying.
+
+Two costs, both accepted. The MCP tool spends a full line explaining the anchor; `/live` spends one snowflake, because it runs on every message the user sends and a sentence there is a sentence billed hundreds of times to matter on a handful. And an id is only actionable with a channel id, which `/live` doesn't carry — the reader who needs to act calls `discord_live` and gets both.
+
+### Gaps get named, including the ones with no count
+
+A `Ctrl+R` keeps the intent and drops the contents, which used to leave the restored state reading `0 buffered, 0 dropped` — indistinguishable from a quiet channel, while `since` still claimed coverage from before the reload. `dropped` couldn't carry it: that counts evictions, and a reload discards an unknown number the ring never got to evict. Hence `resumedAt`, which is set on restore and cleared by the first consuming drain, so it is reported once rather than on every hook fire forever.
+
+`seen` and `matched` are reset by `start()` for the same reason. They render as "since it started", and they used to survive a retarget — so a watch moved from a busy channel to a quiet one kept reporting the busy one's traffic, under a label that said otherwise.
 
 Verified against a live client on 2026-08-01, none of which source-reading could establish:
 
@@ -156,5 +176,5 @@ cd <equicord> && npx tsc --noEmit
 - **Forum channels** appear in `discord_channels` but their threads don't; `discord_threads` isn't built yet.
 - **Search can't see threads.** `SEARCH_GUILD` indexes channel messages; forum posts and thread replies don't reliably come back, which is the same gap `discord_threads` would close.
 - **Attachment urls expire.** `discord_fetch_attachment` re-reads the message to mint a fresh signature rather than trusting a url from an earlier tool result. Don't cache them.
-- **Unresolved replies aren't retried.** Discord's REST doesn't always inline `referenced_message`, so `discord_history` can render `replying to someone (body not loaded)` for a message that is still perfectly fetchable — confirmed live: a reply target that came back unresolved was readable via `around=<id>` a moment later. `current_view` doesn't show this because the cache has the body. Fixing it means either a second fetch per unresolved reply or resolving against the page already in hand, which only helps when the target is in the same window. Left alone for now because the flag is honest about what happened, but it's the cheapest remaining win in transcript quality.
+- **Unresolved replies aren't fetched, only joined.** Discord's REST doesn't always inline `referenced_message`, so a reply can arrive with no body for a message that is still perfectly fetchable — confirmed live: a target that came back unresolved was readable via `around=<id>` a moment later. `compactMessages` now resolves against the page already in hand, which covers the common case for free and costs one `Map` only when the page actually contains an unresolved reply. It lives there rather than in each caller so history, live, marks, search and `current_view` all get it at once, and it runs after `Pseudonymizer` has been over the array so a recovered name is the alias rather than the real one. A target outside the window still isn't fetched — it names `around=<id>` and leaves the round trip to the caller.
 - **One sidecar per machine.** It binds two loopback ports and exits on `EADDRINUSE`, so a hand-started sidecar and a Claude-Code-spawned one can't coexist. The failure surfaces as `Connection closed`, which doesn't point anywhere near the real cause.

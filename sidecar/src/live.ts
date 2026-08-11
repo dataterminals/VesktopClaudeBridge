@@ -51,6 +51,8 @@ export interface LiveRead {
     messages: LiveMessage[];
     /** Evicted before anything read them, carried through so callers can say so. */
     dropped: number;
+    /** A Discord reload discarded the buffer, same reason: a named gap is recoverable. */
+    resumed: string | null;
 }
 
 export async function readLive(
@@ -84,5 +86,10 @@ export async function readLive(
      */
     assertAllowed(cfg, out.state.channel);
 
-    return { state: out.state, messages: out.messages, dropped: out.dropped };
+    return {
+        state: out.state,
+        messages: out.messages,
+        dropped: out.dropped,
+        resumed: out.resumed ?? null
+    };
 }

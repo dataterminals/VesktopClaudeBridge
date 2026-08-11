@@ -222,9 +222,68 @@ export function compactHeader(
     return lines.join("\n");
 }
 
-export function compactMessages(messages: BridgeMessage[], opts: CompactOptions): string {
+/**
+ * First ~120 chars of a message, as a reply excerpt.
+ *
+ * Deliberately the same shape the plugin's `toReplyRef` produces, so a reply
+ * resolved here is indistinguishable from one Discord inlined — it is the same
+ * message either way, and a reader should not have to care which path found it.
+ */
+function excerptOf(m: BridgeMessage): string | null {
+    const body = m.content.replace(/\s+/g, " ").trim();
+    if (!body) return null;
+    return body.length > 120 ? `${body.slice(0, 120)}…` : body;
+}
+
+/**
+ * Fills in reply excerpts from the page already in hand.
+ *
+ * Discord doesn't reliably inline `referenced_message` on the REST path, so a
+ * transcript could render `replying to someone (body not loaded)` for a message
+ * sitting six lines above it in the very same transcript. That is the cheapest
+ * possible context gap: the answer is already in memory, already guarded, and
+ * already paid for.
+ *
+ * This runs *inside* `compactMessages`, which matters for two reasons. Every
+ * renderer goes through it, so history, live, marks, search and current_view all
+ * get the repair from one place. And every call site has already run the
+ * `Pseudonymizer` over the array by then, so a name recovered here is the alias,
+ * not the real display name — resolving any earlier would quietly undo it.
+ *
+ * Only the page is consulted; nothing is fetched. A target outside the window
+ * stays unresolved and says which call would fetch it, on the same principle as
+ * a truncation note — spending a round trip to close a gap is the caller's
+ * decision to make, not the formatter's.
+ */
+function resolveRepliesInPage(messages: BridgeMessage[]): BridgeMessage[] {
+    // Don't build the index for the overwhelmingly common case of nothing to fix.
+    if (!messages.some(m => m.replyTo?.unresolved && m.replyTo.id)) return messages;
+
+    const byId = new Map(messages.map(m => [m.id, m]));
+
+    return messages.map(m => {
+        const ref = m.replyTo;
+        if (!ref?.unresolved || !ref.id) return m;
+
+        const target = byId.get(ref.id);
+        if (!target) return m;
+
+        return {
+            ...m,
+            replyTo: {
+                ...ref,
+                author: target.author.displayName,
+                excerpt: excerptOf(target),
+                unresolved: false
+            }
+        };
+    });
+}
+
+export function compactMessages(input: BridgeMessage[], opts: CompactOptions): string {
     const out: string[] = [];
     const at = stamper(opts.timezone);
+    const messages = resolveRepliesInPage(input);
 
     for (const m of messages) {
         const marks: string[] = [];
@@ -234,7 +293,12 @@ export function compactMessages(messages: BridgeMessage[], opts: CompactOptions)
             const what = m.replyTo.excerpt
                 ? `: "${m.replyTo.excerpt}"`
                 : m.replyTo.unresolved
-                  ? " (body not loaded)"
+                  ? // Names the call that would close it rather than just noting
+                    // that it is open — the gap is recoverable and the reader is
+                    // the one who gets to decide whether it is worth a fetch.
+                    m.replyTo.id
+                      ? ` (not in this page — discord_history around=${m.replyTo.id} to read it)`
+                      : " (body not loaded)"
                   : "";
             marks.push(`   ↳ replying to ${who}${what}`);
         }

@@ -249,7 +249,7 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
         {
             title: "Read what third eye has been watching",
             description:
-                "Drain the buffer the user's 'third eye' has been quietly filling from a channel they're watching. Use this when they refer to what's been happening, what someone said while they were working, or ask you to catch up — and whenever a message hints they've had it running. Returns nothing when it isn't on, which is cheap: this is a pull, so DO NOT poll it. Capture costs the user nothing; reading is the only part that spends anything, so read once and act on it rather than checking repeatedly.",
+                "Drain the buffer the user's 'third eye' has been quietly filling from a channel they're watching. Use this when they refer to what's been happening, what someone said while they were working, or ask you to catch up — and whenever a message hints they've had it running. Returns nothing when it isn't on, which is cheap: this is a pull, so DO NOT poll it. Capture costs the user nothing; reading is the only part that spends anything, so read once and act on it rather than checking repeatedly. The buffer starts empty when they arm it, so it never contains what led up to its first message: the header names that anchor, and discord_history with before=<anchor> reads the run-up when the conversation doesn't stand on its own.",
             inputSchema: {
                 notableOnly: z
                     .boolean()
@@ -291,8 +291,31 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                     `── third eye · ${where}${st.guild ? ` · ${st.guild.name}` : ""}`,
                     `── ${res.messages.length} shown · ${st.pending} buffered · ${st.notablePending} for you · ${st.seen} seen, ${st.matched} matched since it started`
                 ];
+
+                /*
+                 * The buffer's upstream edge, named so it can be crossed.
+                 *
+                 * Nothing in a drained transcript reveals that it starts where
+                 * the user pressed the button rather than where the conversation
+                 * did, so arming this mid-argument hands over the second half
+                 * with no sign there was a first. This is the one line that makes
+                 * the run-up recoverable, and it stays a pointer rather than a
+                 * fetch: whether the earlier context is worth a round trip is the
+                 * reader's call, not this renderer's.
+                 */
+                if (st.anchorId && st.channel) {
+                    head.push(
+                        `── buffered from msg ${st.anchorId} onward — nothing before it was captured; ` +
+                            `discord_history channelId=${st.channel.id} before=${st.anchorId} reads the run-up`
+                    );
+                }
                 if (res.dropped) {
                     head.push(`── (gap: ${res.dropped} message(s) fell out of the buffer before anything read them)`);
+                }
+                if (res.resumed) {
+                    head.push(
+                        `── (gap: Discord reloaded at ${res.resumed}; the watch survived but anything buffered and unread at that point did not)`
+                    );
                 }
                 if (!st.watching) head.push("── the watch has since stopped");
 

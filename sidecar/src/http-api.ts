@@ -343,9 +343,33 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                     if (!out.messages.length) return send(res, 200, "");
 
                     const where = out.state.channel ? `#${out.state.channel.name}` : "(unknown)";
-                    const gap = out.dropped
-                        ? `\n(gap: ${out.dropped} message(s) fell out of the buffer unread)`
-                        : "";
+
+                    /*
+                     * The anchor rides the header line rather than getting a line
+                     * of its own, and carries no instructions with it.
+                     *
+                     * This runs on every message the user sends, so a sentence
+                     * here is a sentence billed hundreds of times to say
+                     * something that matters on a handful of them. One snowflake
+                     * is enough to make the gap recoverable — it says the buffer
+                     * has an upstream edge and where it is, and `discord_live`
+                     * spells out what to do about it for the reader who needs to.
+                     */
+                    const from = out.state.anchorId ? ` · from msg ${out.state.anchorId}` : "";
+
+                    const gaps: string[] = [];
+                    if (out.dropped) {
+                        gaps.push(`(gap: ${out.dropped} message(s) fell out of the buffer unread)`);
+                    }
+                    // Prints once and only once: /live consumes by default, which
+                    // is what clears the flag in the plugin.
+                    if (out.resumed) {
+                        gaps.push(
+                            `(gap: Discord reloaded at ${out.resumed}; the watch survived, anything unread at that point did not)`
+                        );
+                    }
+                    const gap = gaps.length ? `\n${gaps.join("\n")}` : "";
+
                     const body = compactMessages(pseudo.apply(out.messages.map(m => m.message)), {
                         truncateAt: cfg.truncateAt,
                         timezone: cfg.timezone,
@@ -354,7 +378,7 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                     return send(
                         res,
                         200,
-                        `Third eye · ${where} · ${out.messages.length} new · ${zoneNote(cfg.timezone)}${gap}\n\n${body}\n`
+                        `Third eye · ${where} · ${out.messages.length} new · ${zoneNote(cfg.timezone)}${from}${gap}\n\n${body}\n`
                     );
                 }
 

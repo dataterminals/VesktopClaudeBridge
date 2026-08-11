@@ -23,7 +23,7 @@
 import * as DataStore from "@api/DataStore";
 import { ChannelStore, GuildStore, UserStore } from "@webpack/common";
 
-import { toBridgeChannel, toBridgeGuild, toBridgeMessage } from "./discord";
+import { cachedMessages, toBridgeChannel, toBridgeGuild, toBridgeMessage } from "./discord";
 import type { BridgeChannel, BridgeGuild, LiveMessage, ThirdEyeState } from "./protocol";
 import { settings } from "./settings";
 
@@ -42,12 +42,40 @@ interface PersistedIntent {
     channelId: string;
     since: string;
     expiresAt: string;
+    anchorId: string | null;
 }
 
 let channelId: string | null = null;
 let since: string | null = null;
 let expiresAt: number | null = null;
 let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * The newest message in the channel when the watch armed.
+ *
+ * The buffer starts empty and only ever fills forward, so a transcript drained
+ * out of it has an upstream edge that nothing in the transcript itself reveals:
+ * turn this on mid-conversation and a reader gets the second half of an argument
+ * with no sign that there was a first half. Recording where the buffer begins
+ * makes that recoverable — `history before=<anchorId>` is the run-up — and costs
+ * one cache read at arm time rather than anything per message.
+ *
+ * Deliberately not backfilled into the ring. Capture is free precisely because
+ * nothing fetches; seeding it would put a REST page behind a button press, and
+ * would decide on the user's behalf how much run-up was worth paying for. The
+ * anchor hands that choice to the point where tokens are actually spent.
+ */
+let anchorId: string | null = null;
+
+/**
+ * When a Discord reload restored this watch, until something reads the buffer.
+ *
+ * A reload keeps the intent and drops the contents, so the restored state reads
+ * `0 buffered, 0 dropped` — which looks exactly like a channel where nothing has
+ * happened. `dropped` can't carry this: it counts evictions, and a reload
+ * discards an unknown number of messages the ring never got to evict.
+ */
+let resumedAt: string | null = null;
 
 let ring: LiveMessage[] = [];
 let seen = 0;
@@ -143,7 +171,7 @@ function resolveGuild(channel: BridgeChannel | null): BridgeGuild | null {
 function persist(): void {
     const value: PersistedIntent | null =
         channelId && since && expiresAt
-            ? { channelId, since, expiresAt: new Date(expiresAt).toISOString() }
+            ? { channelId, since, expiresAt: new Date(expiresAt).toISOString(), anchorId }
             : null;
     void DataStore.set(STORE_KEY, value).catch(err =>
         console.warn("[VesktopClaudeBridge] could not persist third eye state:", err)
@@ -166,8 +194,21 @@ export function start(id: string): ThirdEyeState {
     channelId = id;
     since = new Date().toISOString();
     expiresAt = Date.now() + AUTO_OFF_MS;
+
+    // Read from the cache, never over REST. You can only arm this on the channel
+    // you have open, so the cache is warm by definition — which keeps `start()`
+    // synchronous and keeps the promise that arming costs nothing. A cold cache
+    // just means no anchor, and an absent anchor says less rather than lying.
+    anchorId = cachedMessages(id, 1)[0]?.id ?? null;
+
+    resumedAt = null;
     ring = [];
     dropped = 0;
+    // Per-watch, not per-session: these render as "since it started", and a watch
+    // moved from a busy channel to a quiet one would otherwise keep reporting the
+    // busy one's traffic.
+    seen = 0;
+    matched = 0;
     refreshTerms();
     armExpiry();
     persist();
@@ -182,6 +223,8 @@ export function stop(expired = false): ThirdEyeState {
     channelId = null;
     since = null;
     expiresAt = null;
+    anchorId = null;
+    resumedAt = null;
     if (expiryTimer) clearTimeout(expiryTimer);
     expiryTimer = null;
     ring = [];
@@ -208,6 +251,12 @@ export async function loadThirdEye(): Promise<void> {
         channelId = saved.channelId;
         since = saved.since;
         expiresAt = expiry;
+        anchorId = saved.anchorId ?? null;
+
+        // The reload is itself a gap, and an unannounced one is worse than an
+        // announced one: `since` still claims coverage from before the reload
+        // while the ring is empty, so silence here reads as "nothing happened".
+        resumedAt = new Date().toISOString();
         armExpiry();
     } catch (err) {
         console.warn("[VesktopClaudeBridge] could not restore third eye state:", err);
@@ -361,6 +410,8 @@ export function state(): ThirdEyeState {
         channel,
         since,
         expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+        anchorId,
+        resumedAt,
         pending: ring.length,
         notablePending: ring.filter(e => e.notable).length,
         seen,
@@ -373,20 +424,27 @@ export function drain(opts: { consume?: boolean; notableOnly?: boolean; limit?: 
     state: ThirdEyeState;
     messages: LiveMessage[];
     dropped: number;
+    resumed: string | null;
 } {
     const wanted = opts.notableOnly ? ring.filter(e => e.notable) : ring;
     const limit = Math.max(1, Math.min(opts.limit ?? 100, RING_MAX));
     const messages = wanted.slice(-limit);
+
+    // Both captured before the clear, and returned beside `state` rather than
+    // inside it, because `state()` below describes the buffer *after* this drain
+    // while these two describe the gap the drain is reporting.
     const droppedNow = dropped;
+    const resumedNow = resumedAt;
 
     if (opts.consume) {
         // Consuming a filtered view would silently bin everything that didn't
         // match, so only a full drain empties the ring.
         ring = opts.notableOnly ? ring.filter(e => !e.notable) : [];
         dropped = 0;
+        resumedAt = null;
     }
 
-    return { state: state(), messages, dropped: droppedNow };
+    return { state: state(), messages, dropped: droppedNow, resumed: resumedNow };
 }
 
 export function pendingCount(): number {

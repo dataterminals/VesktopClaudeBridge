@@ -138,7 +138,9 @@ Capture costs nothing at all — no model, no tokens, no session — so it's fin
 
 Set **Third eye terms** in the plugin settings to a comma-separated list of things you care about — a repo name, a mod name, a build number. Mentions and replies are caught automatically, but conversations *about* your work usually never name you, and that's the case the term list exists for.
 
-Watches lapse after four hours and say so. Turning Discord off and on again keeps the watch but drops anything unread, because message bodies are never written to disk.
+Watches lapse after four hours and say so. Turning Discord off and on again keeps the watch but drops anything unread, because message bodies are never written to disk — and the next read says that happened, rather than handing back an empty buffer that looks like a quiet afternoon.
+
+The buffer starts empty, so it never contains what led up to its first message. Every read names that starting point, so Claude can go back and read the run-up with `discord_history` when the conversation doesn't stand on its own. Nothing is fetched on your behalf: arming stays free, and the choice to spend anything on earlier context happens where you can see it.
 
 **DMs need two switches, and they are deliberately separate.** Set **Third eye watch DMs** in the plugin settings to let the buffer fill from a DM at all, and `denyDms: false` in the sidecar config to let that content leave the renderer. Flip only the first and the buffer fills correctly and then the drain is refused at the boundary; flip only the second and the button still won't arm. The split is the point — the plugin setting decides what is *collected*, the sidecar decides what reaches a model — but it does mean a half-configured setup fails in two different-looking ways.
 

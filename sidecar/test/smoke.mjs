@@ -96,6 +96,34 @@ const MESSAGES = [
     }
 ];
 
+/*
+ * Two replies Discord declined to inline, which is the common REST shape rather
+ * than an edge case. The first points at a message sitting in the same page, so
+ * the formatter can repair it for free; the second points outside the window and
+ * has to stay honest about it.
+ *
+ * Kept out of MESSAGES on purpose — that array backs /current-view and /marked,
+ * whose counts are pinned elsewhere — and appended only to the history answer.
+ */
+const REPLY_GAPS = [
+    {
+        id: "3003", channelId: "2000", guildId: "1000", author: user("9003", "Cass"),
+        timestamp: "2026-08-01T14:34:10.000Z", editedTimestamp: null,
+        content: "same here, clean install too",
+        replyTo: { id: "3001", author: null, excerpt: null, unresolved: true },
+        attachments: [], embeds: [], reactions: [], pinned: false,
+        link: "https://discord.com/channels/1000/2000/3003"
+    },
+    {
+        id: "3004", channelId: "2000", guildId: "1000", author: user("9003", "Cass"),
+        timestamp: "2026-08-01T14:35:00.000Z", editedTimestamp: null,
+        content: "and the other thing you mentioned yesterday",
+        replyTo: { id: "2900", author: null, excerpt: null, unresolved: true },
+        attachments: [], embeds: [], reactions: [], pinned: false,
+        link: "https://discord.com/channels/1000/2000/3004"
+    }
+];
+
 // Search hits are scattered rather than contiguous: two channels, years apart,
 // and a total far larger than the page, so paging and grouping both get tested.
 const SEARCH_HITS = [
@@ -113,6 +141,11 @@ const SEARCH_HITS = [
 const THIRD_EYE_STATE = {
     watching: true, guild: GUILD, channel: CHANNEL,
     since: "2026-08-01T14:00:00.000Z", expiresAt: "2026-08-01T18:00:00.000Z",
+    // Where the buffer begins, and the reload that emptied it once already.
+    // Clearing `resumedAt` happens in the plugin on a consuming drain, which is
+    // the half these tests can't reach; what's pinned here is that the sidecar
+    // reports both gaps rather than rendering a buffer as if it had no edges.
+    anchorId: "3000", resumedAt: "2026-08-01T14:20:00.000Z",
     pending: 2, notablePending: 1, seen: 412, matched: 7, dropped: 2
 };
 
@@ -164,7 +197,7 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS
 
                 switch (frame.method) {
                     case "history":
-                        return answer({ channel: CHANNEL, messages: MESSAGES });
+                        return answer({ channel: CHANNEL, messages: [...MESSAGES, ...REPLY_GAPS] });
                     case "current_view":
                         return answer({
                             guild: GUILD, channel: CHANNEL, messages: MESSAGES,
@@ -201,7 +234,8 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS
                             messages: frame.params?.notableOnly
                                 ? buffer.filter(m => m.notable)
                                 : buffer,
-                            dropped: 2
+                            dropped: 2,
+                            resumed: (dm ? DM_THIRD_EYE_STATE : THIRD_EYE_STATE).resumedAt
                         });
                     }
                     case "search":
@@ -602,6 +636,27 @@ try {
         check("and says which zone that was", liveDmBody.includes("times in America/New_York"));
     }
 
+    console.log("\nreply gaps");
+    /*
+     * Discord doesn't reliably inline `referenced_message` over REST, so a
+     * transcript could render "(body not loaded)" for a message printed six
+     * lines above it. The repair is a join against the page already in hand —
+     * free, and it happens for every renderer at once because it lives in
+     * compactMessages.
+     */
+    const hist = await (await get("/history?channelId=2000&limit=50")).text();
+    check(
+        "an unresolved reply is repaired from the page in hand",
+        hist.includes('↳ replying to Avery: "did the pak actually load"') &&
+            !hist.includes("3001 to read it"),
+        hist.split("\n").filter(l => l.includes("↳")).join(" | ")
+    );
+    check(
+        "one whose target is outside the page names the call that would fetch it",
+        hist.includes("↳ replying to someone (not in this page — discord_history around=2900 to read it)")
+    );
+    check("and is not silently claimed as resolved", !hist.includes('replying to someone: ""'));
+
     console.log("\nhistory anchors");
     // Discord ignores `before` when `after` is present, so the plugin enforces the
     // far bound itself. That enforcement can only be checked against a live client,
@@ -659,8 +714,19 @@ try {
     check("consumes by default so the hook doesn't repeat itself", received["third_eye.drain"]?.consume === true);
     check("notableOnly is forwarded", (await get("/live?notableOnly=1")).status === 200 && received["third_eye.drain"]?.notableOnly === true);
 
+    /*
+     * The buffer starts empty, so a drained transcript begins where the button
+     * was pressed rather than where the conversation did. Both of these name an
+     * edge the transcript itself cannot show; without them a reader gets the
+     * second half of an argument with nothing to suggest there was a first.
+     */
+    check("names where the buffer starts, so the run-up is reachable", live.includes("from msg 3000"));
+    check("reports the reload that emptied it", live.includes("Discord reloaded at 2026-08-01T14:20:00.000Z"));
+    check("and calls that a gap, in the same words as an eviction", live.includes("(gap:"));
+
     const teState = await (await get("/third-eye")).json();
     check("state exposes the volume counters", teState.seen === 412 && teState.matched === 7);
+    check("state carries the anchor for a client that wants it raw", teState.anchorId === "3000");
 
     console.log("\nsearch");
     const search = await (await get("/search?guildId=1000&content=pak")).text();
