@@ -23,7 +23,7 @@ The client already has all of this resolved in memory. This project just exposes
 
 ````
 ── #modding-help · The Forever Winter Modding · text
-── 6 messages · 2026-08-01 10:31:02 → 10:35:40 · times in America/New_York · ids 1399482100000000000 → 1399482900000000000
+── 8 messages · 2026-08-01 10:31:02 → 2026-08-02 05:15:00 · times in America/New_York · ids 1399482100000000000 → 1399483900000000000
 
 [10:31:02] Avery: did the pak actually load or is it silently failing again
 [10:32:40] Bob: silently failing
@@ -35,10 +35,19 @@ The client already has all of this resolved in memory. This project just exposes
 [2026.08.01-14.32.55:481][  0]LogUE4SS: Error: mod folder not found
 ```
 [10:35:40] Avery: ah that's the -894 path thing (edited)
-   👍 2
+   👍 2 (you)
+── 2026-08-02
+[05:15:00] Dana: where should this land?
+   [poll] Public or supporters? · 258 votes · final
+   [poll]   PUBLIC · 227 (88%) ←you
+   [poll]   SUPPORTERS · 31 (12%)
 ````
 
 Mentions, channel links, custom emoji and `<t:>` stamps are resolved to readable text **before** they leave the client — because that's where the stores are. Code fences are passed through byte-exact.
+
+A page that crosses midnight gets a `── 2026-08-02` rule at the boundary, and its header keeps the date on both ends. One sitting gets neither — a date on every line is pure cost when they all share one, and a bare `[05:15:00]` under yesterday's header is how a message gets attributed to the wrong day.
+
+Polls are rendered from the message itself, counts and all, with `←you` on whatever the signed-in account picked. `(you)` on a reaction means the same thing. An answer with no tally prints `—` rather than `0`: Discord does not always send counts, and "nobody voted" is a different claim from "Discord didn't say".
 
 Times are rendered in this machine's timezone, and the header says which one. Discord hands the client UTC instants; a bare `[14:31:02]` with nothing marking it gets read as local by every reader downstream — including the model, which will then tell you someone posted four hours later than they did. Set `timezone` in the sidecar config to any IANA name (`"UTC"`, `"Europe/Berlin"`) to override the default.
 
@@ -197,6 +206,7 @@ Note that the two configs are separate stores, not one shared one — changes yo
 | `discord_resolve_link` | the user pasted a `discord.com/channels/...` link |
 | `discord_search` | "find where someone mentioned X" — you know roughly what was said, not where |
 | `discord_history` | paging back past what the client has cached |
+| `discord_reactors` | who reacted, not how many — sign-up posts, "did I react", overlap between two messages |
 | `discord_guilds` / `discord_channels` | turning "the modding server" into an id |
 | `discord_status` | anything above returned `no_client` |
 
@@ -243,6 +253,7 @@ If a write path is ever added, it should be draft-into-composer: the model write
 - [x] `current_view`, mark queue, history, link resolution, attachments
 - [x] `discord_search` — guild search by text/author/mentions/attachment, with paging
 - [x] Third eye — watch a channel in the background, read it back on demand
+- [x] `discord_reactors` — expand a reaction count into the accounts behind it
 - [ ] `discord_threads` — forum channel listing and thread reads
 - [ ] Mark ranges (shift-click two messages) rather than a fixed context window
 - [ ] Draft-into-composer write path

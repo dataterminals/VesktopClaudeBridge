@@ -59,8 +59,63 @@ export interface BridgeEmbed {
 
 export interface BridgeReaction {
     emoji: string;
+    /**
+     * Set for custom emoji, null for unicode ones.
+     *
+     * `emoji` renders a custom emoji as `:name:`, which reads fine and cannot be
+     * sent back to Discord — its reaction routes are keyed by `name:id`. Keeping
+     * the id is what makes a reaction addressable rather than merely printable.
+     */
+    emojiId: string | null;
     count: number;
+    /** The signed-in account is one of the `count`. */
     me: boolean;
+}
+
+export interface BridgePollAnswer {
+    /** Discord's per-poll answer id. `count` is keyed by this, not by position. */
+    id: number;
+    text: string | null;
+    /**
+     * Votes for this answer, or null when Discord sent no tally at all.
+     *
+     * Null is not zero. A poll the client has already rendered arrives with its
+     * counts inline; one pulled cold out of history can come back with the
+     * question, the options, and no numbers — and reporting that as zero votes
+     * would be a fabricated result rather than a missing one.
+     */
+    count: number | null;
+    /** The signed-in account picked this answer. */
+    me: boolean;
+}
+
+export interface BridgePoll {
+    question: string | null;
+    answers: BridgePollAnswer[];
+    /** ISO 8601, or null for a poll with no expiry set. */
+    expiresAt: string | null;
+    allowMultiselect: boolean;
+    /** Voting has closed; Discord considers the tally final. */
+    finalized: boolean;
+    /**
+     * Sum of every answer's `count`, or null when no counts were sent.
+     *
+     * Votes, not voters. Under `allowMultiselect` one person can appear in
+     * several answers, so this deliberately over-counts people and must not be
+     * read as a headcount.
+     */
+    totalVotes: number | null;
+}
+
+/** One emoji's worth of reactors, as returned by the `reactors` method. */
+export interface ReactorGroup {
+    emoji: string;
+    emojiId: string | null;
+    /** What Discord says the total is — which `users` may fall short of. */
+    count: number;
+    users: BridgeUser[];
+    /** More people reacted than were fetched; raise `limit` to page further. */
+    truncated: boolean;
 }
 
 export interface BridgeReplyRef {
@@ -89,6 +144,14 @@ export interface BridgeMessage {
     attachments: BridgeAttachment[];
     embeds: BridgeEmbed[];
     reactions: BridgeReaction[];
+    /**
+     * Present only on poll messages.
+     *
+     * The client has always held this and the bridge never read it, so a poll
+     * rendered as an empty message with an author and no body — the one shape
+     * that looks like a transcription bug rather than a missing feature.
+     */
+    poll: BridgePoll | null;
     pinned: boolean;
     /** Permalink, so a human can jump to it. */
     link: string;
@@ -218,7 +281,8 @@ export type RpcMethod =
     | "third_eye.state"
     | "third_eye.drain"
     | "guilds"
-    | "channels";
+    | "channels"
+    | "reactors";
 
 export interface RpcParams {
     ping: Record<string, never>;
@@ -256,6 +320,18 @@ export interface RpcParams {
     "third_eye.drain": { consume?: boolean; notableOnly?: boolean; limit?: number; };
     guilds: Record<string, never>;
     channels: { guildId: string; };
+    reactors: {
+        channelId: string;
+        messageId: string;
+        /**
+         * Which reaction to expand, written the way `history` prints it: the
+         * emoji itself for a unicode one, `:name:` or bare `name` for a custom
+         * one. Omit to expand every reaction on the message.
+         */
+        emoji?: string;
+        /** Users to collect per reaction. Discord pages these 100 at a time. */
+        limit?: number;
+    };
 }
 
 export interface RpcResults {
@@ -305,6 +381,21 @@ export interface RpcResults {
     };
     guilds: { guilds: BridgeGuild[]; };
     channels: { channels: BridgeChannel[]; };
+    reactors: {
+        channel: BridgeChannel | null;
+        /** The message itself, so a caller can see what was reacted to. */
+        message: BridgeMessage | null;
+        groups: ReactorGroup[];
+        /**
+         * Reactions left unexpanded because the message carried more distinct
+         * emoji than one call will walk.
+         *
+         * Named rather than dropped, on the same principle as `dropped` and
+         * `truncated`: a partial answer that looks complete is worse than a
+         * short one that says so.
+         */
+        skipped: number;
+    };
 }
 
 export interface RpcError {

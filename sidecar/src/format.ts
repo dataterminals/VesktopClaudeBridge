@@ -16,7 +16,15 @@
 
 import type { Config } from "./config.js";
 import { BridgeError } from "./bridge-server.js";
-import type { BridgeChannel, BridgeGuild, BridgeMessage, MarkedItem, SearchHit } from "./protocol.js";
+import type {
+    BridgeChannel,
+    BridgeGuild,
+    BridgeMessage,
+    BridgeUser,
+    MarkedItem,
+    ReactorGroup,
+    SearchHit
+} from "./protocol.js";
 
 const CHANNEL_TYPES: Record<number, string> = {
     0: "text",
@@ -96,6 +104,20 @@ export class Pseudonymizer {
         const label = this.label(this.map.size);
         this.map.set(id, label);
         return label;
+    }
+
+    /**
+     * Bare users — reactor lists and the like — sharing the message alias map.
+     *
+     * Same person, same label across both surfaces, or cross-referencing a
+     * reactor against the transcript would be impossible under pseudonyms.
+     */
+    applyUsers(users: BridgeUser[]): BridgeUser[] {
+        if (!this.enabled) return users;
+        return users.map(u => {
+            const alias = this.nameFor(u.id);
+            return { ...u, id: alias, username: alias, displayName: alias };
+        });
     }
 
     apply(messages: BridgeMessage[]): BridgeMessage[] {
@@ -216,8 +238,27 @@ export function compactHeader(
     const first = messages[0]!;
     const last = messages[messages.length - 1]!;
     const at = stamper(opts.timezone);
+
+    /*
+     * The closing stamp keeps its date whenever the page crosses a day.
+     *
+     * `datetime → time` reads perfectly for one sitting and becomes a small lie
+     * for anything longer: an announcement channel read a year at a time
+     * rendered as "2026-04-12 19:37:03 → 16:31:12", which looks like it ran
+     * backwards. The opening stamp always carries its date, so only the far end
+     * needs deciding.
+     */
+    const firstAt = new Date(first.timestamp);
+    const lastAt = new Date(last.timestamp);
+    // An unparseable stamp falls to the fuller form, matching stamper(), which
+    // hands back the raw string rather than throwing. localDay() would throw.
+    const sameDay =
+        !Number.isNaN(firstAt.getTime()) &&
+        !Number.isNaN(lastAt.getTime()) &&
+        localDay(opts.timezone, firstAt) === localDay(opts.timezone, lastAt);
+    const spanEnd: CompactOptions["stamp"] = sameDay ? "time" : "datetime";
     lines.push(
-        `── ${messages.length} messages · ${at(first.timestamp, "datetime")} → ${at(last.timestamp, "time")} · ${zoneNote(opts.timezone)} · ids ${first.id} → ${last.id}`
+        `── ${messages.length} messages · ${at(first.timestamp, "datetime")} → ${at(last.timestamp, spanEnd)} · ${zoneNote(opts.timezone)} · ids ${first.id} → ${last.id}`
     );
     return lines.join("\n");
 }
@@ -285,7 +326,28 @@ export function compactMessages(input: BridgeMessage[], opts: CompactOptions): s
     const at = stamper(opts.timezone);
     const messages = resolveRepliesInPage(input);
 
+    let day: string | null = null;
+
     for (const m of messages) {
+        /*
+         * A day rule, emitted only when the transcript actually crosses one.
+         *
+         * `stamp: "time"` assumes a transcript is one sitting, which is true
+         * often enough that putting a date on every line would be pure waste.
+         * When it isn't true — an announcement channel read a year at a time —
+         * a bare `[13:24:39]` silently attributes a message to today. One line
+         * per day crossed costs a fraction of a date per message and closes
+         * that hole; a single-sitting read still emits none at all.
+         */
+        if (opts.stamp !== "datetime") {
+            const at = new Date(m.timestamp);
+            if (!Number.isNaN(at.getTime())) {
+                const today = localDay(opts.timezone, at);
+                if (day && today !== day) out.push(`── ${today}`);
+                day = today;
+            }
+        }
+
         const marks: string[] = [];
 
         if (m.replyTo) {
@@ -315,8 +377,40 @@ export function compactMessages(input: BridgeMessage[], opts: CompactOptions): s
             for (const f of e.fields) marks.push(`   [embed] ${f.name}: ${truncate(f.value, 200)}`);
         }
 
+        if (m.poll) {
+            const p = m.poll;
+            const state = [
+                // "counts not sent" rather than "0 votes": see BridgePollAnswer.
+                p.totalVotes === null
+                    ? "counts not sent"
+                    : `${p.totalVotes} vote${p.totalVotes === 1 ? "" : "s"}`,
+                p.finalized ? "final" : p.expiresAt ? `closes ${p.expiresAt.slice(0, 10)}` : null,
+                // Only worth a word when it changes how the total reads.
+                p.allowMultiselect ? "multi-select, so votes > voters" : null
+            ]
+                .filter(Boolean)
+                .join(" · ");
+
+            marks.push(`   [poll] ${p.question ?? "(no question)"} · ${state}`);
+            for (const a of p.answers) {
+                const share =
+                    p.totalVotes && a.count !== null
+                        ? ` (${Math.round((a.count / p.totalVotes) * 100)}%)`
+                        : "";
+                const tally = a.count === null ? "—" : `${a.count}${share}`;
+                marks.push(
+                    `   [poll]   ${a.text ?? `answer ${a.id}`} · ${tally}${a.me ? " ←you" : ""}`
+                );
+            }
+        }
+
         if (m.reactions.length) {
-            marks.push(`   ${m.reactions.map(r => `${r.emoji} ${r.count}`).join("  ")}`);
+            // `me` was collected all along and never printed, which made "did I
+            // already react to this" unanswerable from a transcript — the one
+            // question a reaction line is actually asked.
+            marks.push(
+                `   ${m.reactions.map(r => `${r.emoji} ${r.count}${r.me ? " (you)" : ""}`).join("  ")}`
+            );
         }
 
         const suffix = [
@@ -558,4 +652,70 @@ export function renderSearchResults(input: SearchRenderInput, opts: CompactOptio
             : "";
 
     return `${lines.join("\n")}\n\n${blocks.join("\n\n")}${more}`;
+}
+
+// ---------------------------------------------------------------------------
+// Reactors
+// ---------------------------------------------------------------------------
+
+export interface ReactorRenderInput {
+    channel: BridgeChannel | null;
+    message: BridgeMessage;
+    groups: ReactorGroup[];
+    skipped: number;
+}
+
+/**
+ * Who reacted, under a one-line reminder of what they reacted to.
+ *
+ * Names are comma-joined rather than one per line: this is a list to scan or
+ * intersect, not a transcript to read, and a hundred names down the page costs
+ * a hundred times the newline for nothing. The message itself is quoted short
+ * for the same reason — enough to confirm the right post, not to re-read it.
+ */
+export function renderReactors(input: ReactorRenderInput, opts: { timezone: string; ids?: boolean; }): string {
+    const { channel, message, groups, skipped } = input;
+
+    const where = channel
+        ? `${channel.isDm ? "" : "#"}${channel.name}${channel.isThread ? " (thread)" : ""}`
+        : "(unknown channel)";
+    const when = stamper(opts.timezone)(message.timestamp, "datetime");
+    const excerpt = excerptOf(message) ?? "(no text)";
+
+    const lines = [
+        `── reactors · ${where} · msg ${message.id}`,
+        `── ${message.author.displayName}, ${when} · ${zoneNote(opts.timezone)}`,
+        `── "${excerpt}"`
+    ];
+
+    if (!groups.length) return `${lines.join("\n")}\n\nNothing has reacted to that message.`;
+
+    for (const g of groups) {
+        const shown = g.users.length;
+        // The gap between what Discord counts and what came back is worth a
+        // word every time: a caller intersecting two reactor lists against each
+        // other gets a wrong answer from a short one it thought was complete.
+        const note = g.truncated
+            ? ` — showing ${shown} of ${g.count}; raise limit to page further`
+            : shown === g.count
+              ? ""
+              : ` — showing ${shown}, Discord reports ${g.count}`;
+
+        lines.push("");
+        lines.push(`${g.emoji} ${g.count}${note}`);
+        lines.push(
+            shown
+                ? `   ${g.users.map(u => (opts.ids ? `${u.displayName} ⟨${u.id}⟩` : u.displayName)).join(", ")}`
+                : "   (none returned)"
+        );
+    }
+
+    if (skipped > 0) {
+        lines.push("");
+        lines.push(
+            `── ${skipped} other reaction${skipped === 1 ? "" : "s"} on this message ${skipped === 1 ? "was" : "were"} not expanded — name one with \`emoji\` to read it.`
+        );
+    }
+
+    return lines.join("\n");
 }

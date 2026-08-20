@@ -36,6 +36,8 @@ import type {
     BridgeEmbed,
     BridgeGuild,
     BridgeMessage,
+    BridgePoll,
+    BridgePollAnswer,
     BridgeReaction,
     BridgeReplyRef,
     BridgeUser,
@@ -247,8 +249,66 @@ function toReaction(raw: any): BridgeReaction {
     const emoji = raw?.emoji ?? {};
     return {
         emoji: emoji.id ? `:${emoji.name}:` : (emoji.name ?? "?"),
+        emojiId: emoji.id ? String(emoji.id) : null,
         count: Number(raw?.count ?? 0),
         me: Boolean(raw?.me)
+    };
+}
+
+function toPollAnswer(raw: any, counts: Map<number, { count: number; me: boolean; }>): BridgePollAnswer {
+    const id = Number(raw?.answer_id ?? raw?.answerId ?? 0);
+    const media = raw?.poll_media ?? raw?.pollMedia ?? {};
+    const tally = counts.get(id);
+    return {
+        id,
+        text: media?.text ?? null,
+        count: tally ? tally.count : null,
+        me: tally ? tally.me : false
+    };
+}
+
+/**
+ * The poll attached to a message, if it is one.
+ *
+ * Discord ships the tally inline as `results.answer_counts` — but only once it
+ * has one to ship. A poll that is still open, or one pulled cold out of history
+ * the client never rendered, comes back with the question and the options and
+ * no numbers, so an absent tally is carried as null per answer rather than
+ * flattened to zero.
+ *
+ * Both spellings are read for the same reason every other mapper here does:
+ * cached MessageRecords and REST payloads disagree about case.
+ */
+function toPoll(raw: any): BridgePoll | null {
+    const poll = raw?.poll;
+    if (!poll) return null;
+
+    const results = poll.results ?? {};
+    const rawCounts = results.answer_counts ?? results.answerCounts;
+    const counts = new Map<number, { count: number; me: boolean; }>();
+    if (Array.isArray(rawCounts)) {
+        for (const c of rawCounts) {
+            counts.set(Number(c?.id ?? 0), {
+                count: Number(c?.count ?? 0),
+                me: Boolean(c?.me_voted ?? c?.meVoted)
+            });
+        }
+    }
+
+    const answers = (Array.isArray(poll.answers) ? poll.answers : []).map((a: any) =>
+        toPollAnswer(a, counts)
+    );
+
+    return {
+        question: poll.question?.text ?? null,
+        answers,
+        expiresAt: toIso(poll.expiry),
+        allowMultiselect: Boolean(poll.allow_multiselect ?? poll.allowMultiselect),
+        finalized: Boolean(results.is_finalized ?? results.isFinalized),
+        // Distinguishes "no tally sent" from "a tally that happens to sum to 0".
+        totalVotes: counts.size
+            ? answers.reduce((n: number, a: BridgePollAnswer) => n + (a.count ?? 0), 0)
+            : null
     };
 }
 
@@ -298,6 +358,7 @@ export function toBridgeMessage(raw: any, channel: BridgeChannel | null): Bridge
         attachments: Array.isArray(raw?.attachments) ? raw.attachments.map(toAttachment) : [],
         embeds: Array.isArray(raw?.embeds) ? raw.embeds.map(toEmbed) : [],
         reactions: Array.isArray(raw?.reactions) ? raw.reactions.map(toReaction) : [],
+        poll: toPoll(raw),
         pinned: Boolean(raw?.pinned),
         link: messageLink(guildId, channelId, id)
     };
@@ -556,6 +617,67 @@ export async function searchMessages(query: SearchQuery): Promise<{
         });
 
     return { hits, totalResults: Number(body.total_results ?? hits.length), indexing };
+}
+
+/** Discord's ceiling on `limit` for the reactions route, same shape as messages. */
+const MAX_REACTORS_PER_REQUEST = 100;
+
+/**
+ * Who reacted, not just how many.
+ *
+ * `history` renders `👍 194`, which answers "how popular was this" and cannot
+ * answer "was I one of them" or "which of these people also turned up later".
+ * Discord pages this 100 at a time, keyed by the emoji rather than an index —
+ * and a custom emoji has to be addressed as `name:id`, which is the whole
+ * reason BridgeReaction carries the id.
+ */
+export async function fetchReactors(
+    channelId: string,
+    messageId: string,
+    reaction: BridgeReaction,
+    limit: number
+): Promise<{ users: BridgeUser[]; truncated: boolean; }> {
+    const bare = reaction.emoji.replace(/^:|:$/g, "");
+    const key = reaction.emojiId ? `${bare}:${reaction.emojiId}` : reaction.emoji;
+    const url = `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(key)}`;
+    const guildId = toBridgeChannel(ChannelStore.getChannel(channelId))?.guildId ?? null;
+
+    const users: BridgeUser[] = [];
+    let after: string | undefined;
+
+    while (users.length < limit) {
+        const want = Math.min(limit - users.length, MAX_REACTORS_PER_REQUEST);
+
+        let response: any;
+        try {
+            response = await RestAPI.get({
+                url,
+                query: after ? { limit: want, after } : { limit: want },
+                retries: 2
+            });
+        } catch (err: any) {
+            const status = err?.status ?? err?.body?.code;
+            throw fail(
+                status === 403 ? "forbidden" : "discord_error",
+                status === 403
+                    ? `No permission to read reactions in channel ${channelId}.`
+                    : `Discord rejected the reactor request (${status ?? "unknown"}).`
+            );
+        }
+
+        const page: any[] = Array.isArray(response?.body) ? response.body : [];
+        for (const u of page) users.push(toBridgeUser(u, guildId));
+
+        // A short page is the end of the list — there is no cursor past it.
+        if (page.length < want) return { users, truncated: false };
+
+        after = page[page.length - 1]?.id;
+        if (!after) break;
+    }
+
+    // Stopped on the caller's budget rather than on Discord running out, so say
+    // whether anything was actually left behind.
+    return { users, truncated: users.length < reaction.count };
 }
 
 export function listGuilds(): BridgeGuild[] {

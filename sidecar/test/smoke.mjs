@@ -124,6 +124,41 @@ const REPLY_GAPS = [
     }
 ];
 
+/*
+ * A poll, a reaction the signed-in account is part of, and a stamp two days
+ * after everything else.
+ *
+ * Three things the renderer used to drop on the floor: the poll was held on the
+ * message and never read, `me` was carried and never printed, and a transcript
+ * that crossed midnight reported the second day's messages under the first
+ * day's date. Appended to the history answer only, for the same reason
+ * REPLY_GAPS is.
+ */
+const POLL_DAY = [
+    {
+        id: "3005", channelId: "2000", guildId: "1000", author: user("9004", "Dana"),
+        timestamp: "2026-08-03T09:15:00.000Z", editedTimestamp: null,
+        content: "where should this land?", replyTo: null,
+        attachments: [], embeds: [],
+        reactions: [{ emoji: "👍", emojiId: null, count: 7, me: true }],
+        poll: {
+            question: "Public or supporters?",
+            answers: [
+                { id: 1, text: "PUBLIC", count: 227, me: true },
+                { id: 2, text: "SUPPORTERS", count: 31, me: false }
+            ],
+            expiresAt: "2026-08-10T09:15:00.000Z",
+            allowMultiselect: false, finalized: true, totalVotes: 258
+        },
+        pinned: false,
+        link: "https://discord.com/channels/1000/2000/3005"
+    }
+];
+
+// Deliberately short of the reported count, so "showing N of M" has something
+// to report — a reactor list that quietly stops is the failure this guards.
+const REACTOR_USERS = [user("9001", "Avery"), user("9002", "Bob"), user("9003", "Cass")];
+
 // Search hits are scattered rather than contiguous: two channels, years apart,
 // and a total far larger than the page, so paging and grouping both get tested.
 const SEARCH_HITS = [
@@ -197,7 +232,16 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS
 
                 switch (frame.method) {
                     case "history":
-                        return answer({ channel: CHANNEL, messages: [...MESSAGES, ...REPLY_GAPS] });
+                        return answer({ channel: CHANNEL, messages: [...MESSAGES, ...REPLY_GAPS, ...POLL_DAY] });
+                    case "reactors":
+                        return answer({
+                            channel: CHANNEL, message: POLL_DAY[0],
+                            groups: [{
+                                emoji: "👍", emojiId: null, count: 7,
+                                users: REACTOR_USERS, truncated: true
+                            }],
+                            skipped: 2
+                        });
                     case "current_view":
                         return answer({
                             guild: GUILD, channel: CHANNEL, messages: MESSAGES,
@@ -656,6 +700,42 @@ try {
         hist.includes("↳ replying to someone (not in this page — discord_history around=2900 to read it)")
     );
     check("and is not silently claimed as resolved", !hist.includes('replying to someone: ""'));
+
+    console.log("\npolls, reactions and day rules");
+    check("renders the poll question and its total", hist.includes("[poll] Public or supporters? · 258 votes · final"));
+    check("renders each answer with its share", hist.includes("PUBLIC · 227 (88%)") && hist.includes("SUPPORTERS · 31 (12%)"));
+    check("marks the answer the account voted for", hist.includes("PUBLIC · 227 (88%) ←you"));
+    // `me` was collected from the very first version and never rendered, so a
+    // transcript could not answer "have I already reacted to this".
+    check("marks a reaction the account is part of", hist.includes("👍 7 (you)"));
+    check("and leaves one it is not alone", hist.includes("👍 2") && !hist.includes("👍 2 (you)"));
+    check(
+        "header keeps the date on both ends when the page crosses days",
+        hist.includes("2026-08-01 14:31:02 → 2026-08-03 09:15:00"),
+        hist.slice(0, 220)
+    );
+    check("and stays a bare clock time when it does not", view.includes("14:31:02 → 14:32:40"));
+    const dayRules = hist.match(/^── \d{4}-\d{2}-\d{2}$/gm) ?? [];
+    check(
+        "rules off the one day boundary it crosses",
+        dayRules.length === 1 && dayRules[0] === "── 2026-08-03",
+        dayRules.join(" | ") || "(no day rules emitted)"
+    );
+
+    console.log("\nreactors");
+    const react = await (await get(`/reactors?channelId=2000&messageId=3005&emoji=${encodeURIComponent("👍")}`)).text();
+    check("names the message that was reacted to", react.includes("msg 3005") && react.includes("Dana"));
+    check("quotes it so the right post is confirmable", react.includes("where should this land?"));
+    check("lists the people behind the count", react.includes("Avery, Bob, Cass"));
+    // The gap between the count and the list is the whole reason this is not
+    // just a number: an intersection against a short list is a wrong answer.
+    check("says the list falls short of the count", react.includes("showing 3 of 7"));
+    check("names the reactions it did not expand", react.includes("2 other reactions"));
+    check("forwards the emoji to the plugin", received.reactors?.emoji === "👍");
+    check(
+        "ids=1 tags accounts for cross-referencing",
+        (await (await get("/reactors?channelId=2000&messageId=3005&ids=1")).text()).includes("⟨9001⟩")
+    );
 
     console.log("\nhistory anchors");
     // Discord ignores `before` when `after` is present, so the plugin enforces the

@@ -22,6 +22,7 @@ import {
     Pseudonymizer,
     assertAllowed,
     compactMessages,
+    renderReactors,
     renderSearchResults,
     renderTranscript,
     zoneNote
@@ -476,6 +477,34 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                     return wantJson
                         ? sendJson(res, 200, channels)
                         : send(res, 200, channels.map(c => `${c.id}  #${c.name}`).join("\n") + "\n");
+                }
+
+                case "/reactors": {
+                    const channelId = q.get("channelId");
+                    const messageId = q.get("messageId");
+                    if (!channelId || !messageId) return send(res, 400, "missing channelId or messageId\n");
+                    const out = await bridge.call("reactors", {
+                        channelId,
+                        messageId,
+                        emoji: q.get("emoji") ?? undefined,
+                        limit: q.has("limit") ? Number.parseInt(q.get("limit")!, 10) : undefined
+                    });
+                    assertAllowed(cfg, out.channel);
+                    if (!out.message) return send(res, 404, "no such message\n");
+                    if (wantJson) return sendJson(res, 200, out);
+                    return send(
+                        res,
+                        200,
+                        renderReactors(
+                            {
+                                channel: out.channel,
+                                message: pseudo.apply([out.message])[0]!,
+                                groups: out.groups.map(g => ({ ...g, users: pseudo.applyUsers(g.users) })),
+                                skipped: out.skipped
+                            },
+                            { timezone: cfg.timezone, ids: q.has("ids") }
+                        ) + "\n"
+                    );
                 }
 
                 case "/attachment": {

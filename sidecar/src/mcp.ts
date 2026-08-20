@@ -21,6 +21,7 @@ import {
     assertAllowed,
     channelTypeName,
     compactMessages,
+    renderReactors,
     renderSearchResults,
     renderTranscript,
     zoneNote
@@ -590,6 +591,57 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                     );
                 }
                 return text(lines.join("\n"));
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_reactors",
+        {
+            title: "List who reacted to a message",
+            description:
+                "Expand a reaction into the actual list of people behind it. `discord_history` reports a reaction as a bare count — this says which accounts make it up. Reach for it whenever the question is who rather than how many: who signed up via a 👍 sign-up post, whether the user themselves reacted, or which people appear on two different messages. Names a single reaction with `emoji`, or expands every reaction on the message when that is omitted. Discord pages these 100 at a time, so a very popular message needs a higher `limit`.",
+            inputSchema: {
+                channelId: z.string().describe("Channel the message is in."),
+                messageId: z.string().describe("Id of the message. discord_history with ids=true prints these."),
+                emoji: z
+                    .string()
+                    .optional()
+                    .describe("Which reaction, written the way history prints it — \"👍\" for a unicode emoji, \":fire1:\" or \"fire1\" for a custom one. Omit to expand every reaction on the message."),
+                limit: z
+                    .number()
+                    .optional()
+                    .describe("Users to collect per reaction (default 100, max 500). Anything short of the reported count is flagged in the output."),
+                ids: z.boolean().optional().describe("Tag every user with their account id, for cross-referencing.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ channelId, messageId, emoji, limit, ids }): Promise<TextResult> => {
+            try {
+                const res = await bridge.call("reactors", { channelId, messageId, emoji, limit });
+                assertAllowed(cfg, res.channel);
+
+                if (!res.message) {
+                    return failure(
+                        new BridgeError({ code: "not_found", message: `Message ${messageId} was not found in ${channelId}.` })
+                    );
+                }
+
+                return text(
+                    renderReactors(
+                        {
+                            channel: res.channel,
+                            // Pseudonymised through the same map the transcripts
+                            // use, so an alias means the same person in both.
+                            message: pseudo.apply([res.message])[0]!,
+                            groups: res.groups.map(g => ({ ...g, users: pseudo.applyUsers(g.users) })),
+                            skipped: res.skipped
+                        },
+                        { timezone: cfg.timezone, ids: ids ?? false }
+                    )
+                );
             } catch (err) {
                 return failure(err);
             }
