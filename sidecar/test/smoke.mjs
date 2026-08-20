@@ -236,10 +236,34 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS
                     case "reactors":
                         return answer({
                             channel: CHANNEL, message: POLL_DAY[0],
-                            groups: [{
-                                emoji: "👍", emojiId: null, count: 7,
-                                users: REACTOR_USERS, truncated: true
-                            }],
+                            groups: [
+                                // No burst/error keys at all: this is what a
+                                // plugin older than the sidecar sends, which is
+                                // the normal state of this repo between builds.
+                                {
+                                    emoji: "👍", emojiId: null, count: 7,
+                                    users: REACTOR_USERS, truncated: true
+                                },
+                                {
+                                    emoji: "✨", emojiId: null, count: 2,
+                                    users: [user("9004", "Dev"), user("9005", "Eli")],
+                                    truncated: false, burst: 2, error: null
+                                },
+                                // Half plain, half super — the count is one number
+                                // but it took two lists to answer.
+                                {
+                                    emoji: "🔥", emojiId: null, count: 3,
+                                    users: [user("9006", "Fen"), user("9007", "Gus"), user("9008", "Hana")],
+                                    truncated: false, burst: 1, error: null
+                                },
+                                // The shape that started all this: Discord counts
+                                // thirteen and hands back nobody.
+                                {
+                                    emoji: ":cooldman:", emojiId: "42", count: 13,
+                                    users: [], truncated: false, burst: 0,
+                                    error: "Discord rejected the request (429)"
+                                }
+                            ],
                             skipped: 2
                         });
                     case "current_view":
@@ -735,6 +759,21 @@ try {
     check(
         "ids=1 tags accounts for cross-referencing",
         (await (await get("/reactors?channelId=2000&messageId=3005&ids=1")).text()).includes("⟨9001⟩")
+    );
+    // "Discord refused" and "nobody reacted" are opposite answers to the only
+    // question this tool is asked, and both used to print "(none returned)".
+    check(
+        "says a reaction that was refused was refused",
+        react.includes("could not be read: Discord rejected the request (429)")
+    );
+    check("and does not pass a refusal off as nobody reacting", !react.includes("(none returned)"));
+    // A super reaction is counted with the plain ones and served separately, so
+    // a list that is entirely super is worth saying out loud.
+    check("names a super-reaction list as one", react.includes("✨ 2 · all super reactions"));
+    check("counts the super ones when only some are", react.includes("🔥 3 · 1 super"));
+    check(
+        "still renders a group from a plugin too old to send either field",
+        react.includes("👍 7") && !react.includes("👍 7 ·")
     );
 
     console.log("\nhistory anchors");

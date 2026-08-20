@@ -229,7 +229,7 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
         // catch because it never compiles this half.
         const groups: ReactorGroup[] = [];
         for (const reaction of expand) {
-            const { users, truncated } = await fetchReactors(
+            const { users, truncated, burst, error } = await fetchReactors(
                 params.channelId,
                 params.messageId,
                 reaction,
@@ -240,7 +240,9 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
                 emojiId: reaction.emojiId,
                 count: reaction.count,
                 users,
-                truncated
+                truncated,
+                burst,
+                error
             });
         }
 

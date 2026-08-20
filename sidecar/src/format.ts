@@ -692,22 +692,33 @@ export function renderReactors(input: ReactorRenderInput, opts: { timezone: stri
 
     for (const g of groups) {
         const shown = g.users.length;
+        const burst = g.burst ?? 0;
         // The gap between what Discord counts and what came back is worth a
         // word every time: a caller intersecting two reactor lists against each
         // other gets a wrong answer from a short one it thought was complete.
-        const note = g.truncated
-            ? ` — showing ${shown} of ${g.count}; raise limit to page further`
-            : shown === g.count
-              ? ""
-              : ` — showing ${shown}, Discord reports ${g.count}`;
+        // A refusal is called one, because "nobody could be read" and "nobody
+        // is there" are opposite answers that otherwise print identically.
+        const note = g.error
+            ? ` — could not be read: ${g.error}`
+            : g.truncated
+              ? ` — showing ${shown} of ${g.count}; raise limit to page further`
+              : shown === g.count
+                ? ""
+                : ` — showing ${shown}, Discord reports ${g.count}`;
+
+        // Worth naming: a super reaction is a deliberate, paid-for thing, and a
+        // list that is entirely super reactions is a different social fact from
+        // the same names on a plain one.
+        const kind = burst ? (burst === shown ? " · all super reactions" : ` · ${burst} super`) : "";
 
         lines.push("");
-        lines.push(`${g.emoji} ${g.count}${note}`);
-        lines.push(
-            shown
-                ? `   ${g.users.map(u => (opts.ids ? `${u.displayName} ⟨${u.id}⟩` : u.displayName)).join(", ")}`
-                : "   (none returned)"
-        );
+        lines.push(`${g.emoji} ${g.count}${note}${kind}`);
+        if (shown) {
+            lines.push(`   ${g.users.map(u => (opts.ids ? `${u.displayName} ⟨${u.id}⟩` : u.displayName)).join(", ")}`);
+        } else if (!g.error) {
+            // No refusal to blame, so this really is what Discord returned.
+            lines.push("   (none returned)");
+        }
     }
 
     if (skipped > 0) {

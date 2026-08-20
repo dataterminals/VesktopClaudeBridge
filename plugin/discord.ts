@@ -630,54 +630,91 @@ const MAX_REACTORS_PER_REQUEST = 100;
  * Discord pages this 100 at a time, keyed by the emoji rather than an index —
  * and a custom emoji has to be addressed as `name:id`, which is the whole
  * reason BridgeReaction carries the id.
+ *
+ * The route answers for one *kind* of reaction at a time — `type=0` plain,
+ * `type=1` super — while the count on the message adds both together. Ask only
+ * for the default and a message super-reacted thirteen times reports thirteen
+ * and then hands back nobody, which reads exactly like a message whose reactors
+ * are unreadable. So the burst list is fetched too, but only once the plain one
+ * has genuinely run out: the ordinary reaction stays one request.
+ *
+ * A rejection is reported rather than thrown. One unreadable reaction should
+ * not lose the five beside it that came back fine, and "Discord refused" has to
+ * stay distinguishable from "nobody is there" — those are opposite answers to
+ * "who is on this list", and an empty array alone cannot tell them apart.
  */
 export async function fetchReactors(
     channelId: string,
     messageId: string,
     reaction: BridgeReaction,
     limit: number
-): Promise<{ users: BridgeUser[]; truncated: boolean; }> {
+): Promise<{ users: BridgeUser[]; truncated: boolean; burst: number; error: string | null; }> {
     const bare = reaction.emoji.replace(/^:|:$/g, "");
     const key = reaction.emojiId ? `${bare}:${reaction.emojiId}` : reaction.emoji;
     const url = `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(key)}`;
     const guildId = toBridgeChannel(ChannelStore.getChannel(channelId))?.guildId ?? null;
 
     const users: BridgeUser[] = [];
-    let after: string | undefined;
+    const seen = new Set<string>();
+    let burst = 0;
 
-    while (users.length < limit) {
-        const want = Math.min(limit - users.length, MAX_REACTORS_PER_REQUEST);
+    // Pages one type to exhaustion or to the caller's budget, whichever comes
+    // first. Returns whether Discord ran out of people, which is what decides
+    // if there is any point asking for the other type.
+    const collect = async (type: 0 | 1): Promise<boolean> => {
+        let after: string | undefined;
 
-        let response: any;
-        try {
-            response = await RestAPI.get({
+        while (users.length < limit) {
+            const want = Math.min(limit - users.length, MAX_REACTORS_PER_REQUEST);
+            const response = await RestAPI.get({
                 url,
-                query: after ? { limit: want, after } : { limit: want },
+                query: after ? { limit: want, type, after } : { limit: want, type },
                 retries: 2
             });
-        } catch (err: any) {
-            const status = err?.status ?? err?.body?.code;
-            throw fail(
-                status === 403 ? "forbidden" : "discord_error",
-                status === 403
-                    ? `No permission to read reactions in channel ${channelId}.`
-                    : `Discord rejected the reactor request (${status ?? "unknown"}).`
-            );
+
+            const page: any[] = Array.isArray(response?.body) ? response.body : [];
+            for (const u of page) {
+                const mapped = toBridgeUser(u, guildId);
+                // Nothing says a super-reactor cannot also hold a plain one, and
+                // the same name twice would inflate an intersection silently.
+                if (seen.has(mapped.id)) continue;
+                seen.add(mapped.id);
+                users.push(mapped);
+                if (type === 1) burst++;
+            }
+
+            // A short page is the end of the list — there is no cursor past it.
+            if (page.length < want) return true;
+
+            after = page[page.length - 1]?.id;
+            if (!after) return true;
         }
 
-        const page: any[] = Array.isArray(response?.body) ? response.body : [];
-        for (const u of page) users.push(toBridgeUser(u, guildId));
+        return false;
+    };
 
-        // A short page is the end of the list — there is no cursor past it.
-        if (page.length < want) return { users, truncated: false };
-
-        after = page[page.length - 1]?.id;
-        if (!after) break;
+    let ranOut: boolean;
+    try {
+        ranOut = await collect(0);
+        if (ranOut && users.length < reaction.count && users.length < limit) {
+            ranOut = await collect(1);
+        }
+    } catch (err: any) {
+        const status = err?.status ?? err?.body?.code;
+        return {
+            users,
+            burst,
+            truncated: false,
+            error:
+                status === 403
+                    ? `no permission to read reactions in channel ${channelId}`
+                    : `Discord rejected the request (${status ?? "unknown"})`
+        };
     }
 
     // Stopped on the caller's budget rather than on Discord running out, so say
     // whether anything was actually left behind.
-    return { users, truncated: users.length < reaction.count };
+    return { users, burst, error: null, truncated: !ranOut && users.length < reaction.count };
 }
 
 export function listGuilds(): BridgeGuild[] {

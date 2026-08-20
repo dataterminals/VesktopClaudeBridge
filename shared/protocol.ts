@@ -116,6 +116,23 @@ export interface ReactorGroup {
     users: BridgeUser[];
     /** More people reacted than were fetched; raise `limit` to page further. */
     truncated: boolean;
+    /**
+     * How many of `users` are super reactions rather than plain ones. Discord
+     * counts both in `count` but serves them from separate lists, so this is
+     * the difference between a reaction nobody can be read from and one that
+     * simply had to be asked for twice.
+     *
+     * Optional because a plugin build older than the sidecar does not send it,
+     * which is a state this project is in every time only one half is rebuilt.
+     */
+    burst?: number;
+    /**
+     * Why the list is short, when Discord refused rather than ran out. Null or
+     * absent when nothing failed — and that is the whole point of the field:
+     * an empty `users` cannot otherwise say whether nobody reacted or nobody
+     * could be read.
+     */
+    error?: string | null;
 }
 
 export interface BridgeReplyRef {
