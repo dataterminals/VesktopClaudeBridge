@@ -18,6 +18,7 @@ import type { Config } from "./config.js";
 import { BridgeError } from "./bridge-server.js";
 import type {
     BridgeChannel,
+    BridgeDm,
     BridgeGuild,
     BridgeMessage,
     BridgeUser,
@@ -52,20 +53,89 @@ export function isDmChannel(channel: BridgeChannel): boolean {
 }
 
 /**
+ * Whether a DM's recipients clear `allowDms`.
+ *
+ * The filtering counterpart to the throw below, and the reason both exist: the
+ * `dms` listing hides what it may not serve, while every content read refuses
+ * outright. Sharing the predicate is what stops those two answers disagreeing
+ * about the same channel — a DM the listing showed and a read then refused
+ * would read as a bug in the bridge rather than as the config it is.
+ *
+ * Empty `allowDms` means every DM, so this is a no-op until someone opts in;
+ * `denyDms` is the switch that decides whether DMs are readable at all.
+ *
+ * `every` rather than `some`: a group DM with one allowlisted member in it also
+ * carries what the others said, and being on the list is not something one
+ * person can consent to on four people's behalf. No recipients at all fails
+ * closed for the same reason — see BridgeChannel.recipientIds.
+ */
+export function dmAllowed(cfg: Config, recipientIds: string[]): boolean {
+    if (cfg.allowDms.length === 0) return true;
+    return recipientIds.length > 0 && recipientIds.every(id => cfg.allowDms.includes(id));
+}
+
+/**
+ * The `allowDms` half of the DM guard, as a refusal.
+ *
+ * Split out because the two ways to fail it want different sentences, and the
+ * difference matters: an unlisted recipient is a decision the user made, while
+ * a DM channel carrying no recipient ids at all is almost always a plugin half
+ * older than this sidecar. Telling those apart is the difference between "add
+ * this id" and "rebuild the plugin", and guessing wrong sends someone editing
+ * a config file that was already correct.
+ *
+ * Ids are named in the message rather than withheld. That matches what the
+ * guild refusal beside it already does, and it is the whole of what makes the
+ * setting actionable — a refusal that will not say what to add is a dead end.
+ */
+function assertDmAllowlisted(cfg: Config, channel: BridgeChannel): void {
+    const recipients = channel.recipientIds ?? [];
+    if (dmAllowed(cfg, recipients)) return;
+
+    if (recipients.length === 0) {
+        throw new BridgeError({
+            code: "forbidden",
+            message:
+                `Channel ${channel.id} is a DM and "allowDms" is set, but it carried no recipient ids, so it cannot be checked against the list. ` +
+                "A plugin build older than this sidecar does not send them — rebuild the plugin, or set \"allowDms\": [] to allow every DM."
+        });
+    }
+
+    const strangers = recipients.filter(id => !cfg.allowDms.includes(id));
+    const one = strangers.length === 1;
+    throw new BridgeError({
+        code: "forbidden",
+        message:
+            `${strangers.join(", ")} ${one ? "is" : "are"} not in the sidecar's "allowDms" list, so this DM is refused. ` +
+            `Add ${one ? "that id" : "those ids"} to "allowDms", or set it to [] to allow every DM.`
+    });
+}
+
+/**
  * Enforces the scope rules before any content is handed back.
  *
  * "Read my discord" should not silently mean "read all of it" — so DMs are off
  * unless asked for, and an explicit guild allowlist wins when one is configured.
+ *
+ * `allowDms` narrows the DM side the way `allowGuilds` narrows the guild side,
+ * and it is checked *inside* the DM branch rather than beside it so that the
+ * guild allowlist below keeps applying to DMs exactly as it did before. A DM
+ * has no guildId, so a configured `allowGuilds` already refuses every one of
+ * them today; that is pre-existing behaviour and not something to relax while
+ * adding a second restriction.
  */
 export function assertAllowed(cfg: Config, channel: BridgeChannel | null): void {
     if (!channel) return;
 
-    if (cfg.denyDms && isDmChannel(channel)) {
-        throw new BridgeError({
-            code: "forbidden",
-            message:
-                "This is a DM, and DMs are disabled. Set \"denyDms\": false in the sidecar config to allow them."
-        });
+    if (isDmChannel(channel)) {
+        if (cfg.denyDms) {
+            throw new BridgeError({
+                code: "forbidden",
+                message:
+                    "This is a DM, and DMs are disabled. Set \"denyDms\": false in the sidecar config to allow them."
+            });
+        }
+        assertDmAllowlisted(cfg, channel);
     }
 
     if (cfg.allowGuilds.length > 0) {
@@ -652,6 +722,65 @@ export function renderSearchResults(input: SearchRenderInput, opts: CompactOptio
             : "";
 
     return `${lines.join("\n")}\n\n${blocks.join("\n\n")}${more}`;
+}
+
+// ---------------------------------------------------------------------------
+// Direct messages
+// ---------------------------------------------------------------------------
+
+export interface DmRenderInput {
+    /** Already sorted most-recently-active first by the plugin. */
+    dms: BridgeDm[];
+    /** Withheld by `allowDms`, counted rather than quietly dropped. */
+    hidden: number;
+}
+
+/**
+ * The DM list, as a lookup table rather than a transcript.
+ *
+ * Channel id first, because the only reason to call this is to feed one to
+ * another tool. Then the people, since "the DM with Avery" is the question being
+ * asked — a one-to-one's own name is a synthesised `dm:handle` label and a group
+ * DM's is usually empty, so neither is the thing anyone matches on.
+ *
+ * The order is itself the answer to "which one did they mean", so the header
+ * says what the order is. A channel the client holds no last-message id for
+ * cannot take part in that sort at all, and says so rather than sitting at the
+ * bottom looking merely quiet.
+ *
+ * No timestamps anywhere, which is why this takes no timezone: `lastMessageId`
+ * is a snowflake, and decoding one into a wall clock to print beside every row
+ * would spend real width to restate the ordering the rows are already in.
+ */
+export function renderDms(input: DmRenderInput, opts: { ids?: boolean; }): string {
+    const { dms, hidden } = input;
+
+    const withheld = hidden
+        ? ` · ${hidden} withheld by the sidecar's allowDms list`
+        : "";
+
+    if (!dms.length) {
+        return hidden
+            ? `── no readable DMs · all ${hidden} of them are outside the sidecar's allowDms list`
+            : "── no DM channels";
+    }
+
+    const lines = [
+        `── ${dms.length} direct message${dms.length === 1 ? "" : "s"} · most recently active first${withheld}`
+    ];
+
+    for (const dm of dms) {
+        const who = dm.recipients.length
+            ? dm.recipients.map(u => (opts.ids ? `${u.displayName} ⟨${u.id}⟩` : u.displayName)).join(", ")
+            // A group DM everyone else has left. It still holds its history, and
+            // an empty column would read as a rendering fault rather than a fact.
+            : "(nobody else in it)";
+        const title = dm.name ? `${dm.name} · ` : "";
+        const unplaced = dm.lastMessageId ? "" : " · no last message, so unplaced in the order above";
+        lines.push(`${dm.id}  ${channelTypeName(dm.type).padEnd(9)} ${title}${who}${unplaced}`);
+    }
+
+    return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,8 @@ import {
     Pseudonymizer,
     assertAllowed,
     compactMessages,
+    dmAllowed,
+    renderDms,
     renderReactors,
     renderSearchResults,
     renderTranscript,
@@ -199,6 +201,7 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                         scope: {
                             allowGuilds: cfg.allowGuilds,
                             denyDms: cfg.denyDms,
+                            allowDms: cfg.allowDms,
                             pseudonymize: cfg.pseudonymize
                         }
                     });
@@ -477,6 +480,44 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                     return wantJson
                         ? sendJson(res, 200, channels)
                         : send(res, 200, channels.map(c => `${c.id}  #${c.name}`).join("\n") + "\n");
+                }
+
+                case "/dms": {
+                    /*
+                     * Same two-part guard as the MCP tool, in the same order and
+                     * for the same reason. `denyDms` refuses the whole listing
+                     * because the listing is the disclosure — handles, account
+                     * ids and who the user talks to most, with no message body
+                     * anywhere in it. `allowDms` then filters, sharing its
+                     * predicate with the guard that refuses the reads, so this
+                     * route and /history can never disagree about one channel.
+                     */
+                    if (cfg.denyDms) {
+                        return send(
+                            res,
+                            403,
+                            "forbidden: DMs are disabled, and listing them would disclose who the account talks to. Set \"denyDms\": false in the sidecar config.\n"
+                        );
+                    }
+                    const { dms } = await bridge.call("dms", {});
+                    // On the real ids, before any pseudonym rewrites them.
+                    const visible = dms.filter(d => dmAllowed(cfg, d.recipients.map(u => u.id)));
+                    return wantJson
+                        ? sendJson(res, 200, visible)
+                        : send(
+                              res,
+                              200,
+                              renderDms(
+                                  {
+                                      dms: visible.map(d => ({
+                                          ...d,
+                                          recipients: pseudo.applyUsers(d.recipients)
+                                      })),
+                                      hidden: dms.length - visible.length
+                                  },
+                                  { ids }
+                              ) + "\n"
+                          );
                 }
 
                 case "/reactors": {

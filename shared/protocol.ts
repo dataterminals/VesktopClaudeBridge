@@ -186,6 +186,56 @@ export interface BridgeChannel {
     parentId: string | null;
     isThread: boolean;
     isDm: boolean;
+    /**
+     * Recipient account ids. Populated on DM and group-DM channels, absent on
+     * everything else, because a guild channel has no recipients to carry.
+     *
+     * This rides on the channel rather than being threaded into the sidecar's
+     * scope guard as a second argument, and that is the design choice worth
+     * writing down. `assertAllowed` is called from fifteen places across four
+     * files, and every one of them holds a channel and nothing else -- a
+     * parameter would make each call site separately responsible for finding
+     * the recipients, which is precisely the drift that left the guard
+     * downstream of one of two exits in both `/marked` and `/live`. One field
+     * on the object the guard already receives cannot drift.
+     *
+     * Optional because a plugin build older than the sidecar does not send it,
+     * which is the state this repo sits in between every pair of builds. The
+     * sidecar reads absent-under-a-non-empty-`allowDms` as a refusal rather
+     * than a pass: an allowlist that fails open is not an allowlist.
+     */
+    recipientIds?: string[];
+}
+
+/**
+ * One DM or group-DM channel, with the people in it.
+ *
+ * A `BridgeChannel` cannot answer "which of these is the DM with Avery". Its
+ * `name` for a one-to-one is a synthesised `dm:handle` label, and a group DM's
+ * is whatever the group was titled -- usually nothing. So the recipients are
+ * carried as users, which is also what makes an id here feed straight into
+ * `search authorId=`.
+ */
+export interface BridgeDm {
+    id: string;
+    /** 1 for a one-to-one DM, 3 for a group DM. Raw, so the sidecar labels it. */
+    type: number;
+    /** Everyone in the channel besides the signed-in account. */
+    recipients: BridgeUser[];
+    /** Group DMs can be titled; a one-to-one never is. */
+    name: string | null;
+    /**
+     * Newest message the client already knew about, or null when it holds no
+     * record of one.
+     *
+     * Read straight off the channel record and never fetched -- it exists so
+     * that "the DM with them" can be ordered by recency without a round trip
+     * per channel, which for an account with two hundred DMs is the difference
+     * between a listing and a rate limit. Null is not "empty": it is "the
+     * client cannot place this one in that order", and the renderer says so
+     * rather than parking it at the bottom looking merely stale.
+     */
+    lastMessageId: string | null;
 }
 
 export interface BridgeGuild {
@@ -299,6 +349,7 @@ export type RpcMethod =
     | "third_eye.drain"
     | "guilds"
     | "channels"
+    | "dms"
     | "reactors";
 
 export interface RpcParams {
@@ -337,6 +388,11 @@ export interface RpcParams {
     "third_eye.drain": { consume?: boolean; notableOnly?: boolean; limit?: number; };
     guilds: Record<string, never>;
     channels: { guildId: string; };
+    /**
+     * Takes nothing. The private-channel list is not scoped by anything the
+     * caller could pass -- there is exactly one of it per account.
+     */
+    dms: Record<string, never>;
     reactors: {
         channelId: string;
         messageId: string;
@@ -398,6 +454,8 @@ export interface RpcResults {
     };
     guilds: { guilds: BridgeGuild[]; };
     channels: { channels: BridgeChannel[]; };
+    /** Already sorted most-recently-active first; the sidecar renders in order. */
+    dms: { dms: BridgeDm[]; };
     reactors: {
         channel: BridgeChannel | null;
         /** The message itself, so a caller can see what was reacted to. */

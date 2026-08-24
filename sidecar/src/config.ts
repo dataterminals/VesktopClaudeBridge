@@ -28,6 +28,20 @@ export interface Config {
     /** When true, DM and group-DM channels are refused outright. */
     denyDms: boolean;
     /**
+     * Recipient ids whose DMs the bridge will serve. Empty array = every DM.
+     *
+     * `denyDms` stays the master switch and this only narrows what it already
+     * allows, so an empty list here opens nothing up -- which is also what
+     * keeps an existing `denyDms: false` setup working unchanged. Ids rather
+     * than handles for the same reason `allowGuilds` takes ids: a handle can be
+     * changed by the person holding it, an id cannot.
+     *
+     * A group DM needs *every* recipient listed, not just one. Reading it hands
+     * over what the unlisted members said as well, and one allowlisted person
+     * in the room is not consent from the other four.
+     */
+    allowDms: string[];
+    /**
      * Replace author identities with stable pseudonyms (`user_a`, `user_b`, ...)
      * on the way out of the sidecar, so real handles never reach the model's
      * context in the first place. Useful when the transcript is headed somewhere
@@ -233,6 +247,7 @@ export function loadConfig(): Config {
             join(tmpdir(), "vesktop-claude-bridge"),
         allowGuilds: file.allowGuilds ?? [],
         denyDms: envFlag("VCB_DENY_DMS") ?? file.denyDms ?? true,
+        allowDms: file.allowDms ?? [],
         pseudonymize: envFlag("VCB_PSEUDONYMIZE") ?? file.pseudonymize ?? false,
         defaultLimit: envInt("VCB_DEFAULT_LIMIT") ?? file.defaultLimit ?? 50,
         maxLimit: envInt("VCB_MAX_LIMIT") ?? file.maxLimit ?? 200,
@@ -259,6 +274,7 @@ export function ensureConfigFile(cfg: Config): string {
         timezone: cfg.timezone,
         allowGuilds: [],
         denyDms: true,
+        allowDms: [],
         pseudonymize: false,
         defaultLimit: cfg.defaultLimit,
         maxLimit: cfg.maxLimit,

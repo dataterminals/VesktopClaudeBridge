@@ -21,6 +21,8 @@ import {
     assertAllowed,
     channelTypeName,
     compactMessages,
+    dmAllowed,
+    renderDms,
     renderReactors,
     renderSearchResults,
     renderTranscript,
@@ -93,7 +95,10 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                     `plugin:    ${s.pluginVersion ?? "n/a"}`,
                     `since:     ${s.connectedSince ?? "n/a"}`,
                     `port:      ${s.port}`,
-                    `scope:     ${cfg.allowGuilds.length ? `${cfg.allowGuilds.length} allowlisted guild(s)` : "all guilds"}, DMs ${cfg.denyDms ? "denied" : "allowed"}`,
+                    // The DM half spells out `allowDms` rather than just
+                    // "allowed", because a scoped setup and an open one differ
+                    // in exactly the way that makes discord_dms come back short.
+                    `scope:     ${cfg.allowGuilds.length ? `${cfg.allowGuilds.length} allowlisted guild(s)` : "all guilds"}, DMs ${cfg.denyDms ? "denied" : cfg.allowDms.length ? `allowed for ${cfg.allowDms.length} allowlisted recipient(s)` : "allowed"}`,
                     `pseudonyms: ${cfg.pseudonymize ? "on" : "off"}`
                 ].join("\n")
             );
@@ -525,6 +530,72 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                             return `${c.id}  ${kind.padEnd(12)} #${c.name}${topic}`;
                         })
                         .join("\n")
+                );
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_dms",
+        {
+            title: "List direct messages",
+            description:
+                "List the account's DMs and group DMs with the people in each, most recently active first. This is how you turn \"the DM with Avery\" into a channelId for discord_history or discord_search — discord_channels only knows a server's channels, so there is no other way to find one. Reach for it the moment the user names a person rather than a place. Do NOT go looking for a DM with discord_current_view: that reads whichever conversation happens to be on screen, which is how you end up reading a private one nobody asked about.",
+            inputSchema: {
+                ids: z
+                    .boolean()
+                    .optional()
+                    .describe("Tag every recipient with their account id, which is what discord_search authorId= wants.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ ids }): Promise<TextResult> => {
+            try {
+                /*
+                 * Guarded by hand rather than through assertAllowed, because
+                 * there is no channel here to guard — only a list of them. Both
+                 * halves still come from the same place: `denyDms` refuses
+                 * outright and `dmAllowed` filters, so this surface cannot
+                 * disagree with the read that follows it about any one channel.
+                 *
+                 * The refusal is not pedantry about content. This listing *is*
+                 * the disclosure: names, account ids and who the user talks to
+                 * most, without a single message body in it. Serving it under
+                 * denyDms would hand over the address book while claiming the
+                 * letters were private.
+                 */
+                if (cfg.denyDms) {
+                    return failure(
+                        new BridgeError({
+                            code: "forbidden",
+                            message:
+                                "DMs are disabled, and listing them would disclose who the account talks to. Set \"denyDms\": false in the sidecar config to allow them."
+                        })
+                    );
+                }
+
+                const { dms } = await bridge.call("dms", {});
+                // Filtered on the real ids, before the Pseudonymizer rewrites
+                // them — an alias would match nothing in allowDms and every DM
+                // would vanish under `pseudonymize: true`.
+                const visible = dms.filter(d => dmAllowed(cfg, d.recipients.map(u => u.id)));
+
+                if (!visible.length && !dms.length) {
+                    return text(
+                        "The client reports no DM channels at all. If the user is sure they have some, the plugin may have connected before Discord finished loading its stores — discord_status says whether it is connected."
+                    );
+                }
+
+                return text(
+                    renderDms(
+                        {
+                            dms: visible.map(d => ({ ...d, recipients: pseudo.applyUsers(d.recipients) })),
+                            hidden: dms.length - visible.length
+                        },
+                        { ids: ids ?? false }
+                    )
                 );
             } catch (err) {
                 return failure(err);

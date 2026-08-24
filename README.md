@@ -208,6 +208,7 @@ Note that the two configs are separate stores, not one shared one — changes yo
 | `discord_history` | paging back past what the client has cached |
 | `discord_reactors` | who reacted, not how many — sign-up posts, "did I react", overlap between two messages |
 | `discord_guilds` / `discord_channels` | turning "the modding server" into an id |
+| `discord_dms` | "the DM with <person>" — the only way to find one, since `discord_channels` can't see DMs |
 | `discord_status` | anything above returned `no_client` |
 
 Everything is also on `http://127.0.0.1:8788` with `Authorization: Bearer <token>`, returning the same text — useful from Bash when MCP isn't wired:
@@ -224,13 +225,15 @@ This is also the fastest way to debug the bridge itself, since it doesn't need M
 npm test
 ```
 
-Boots the real sidecar with a fake plugin standing in for Discord, then checks the things that are invisible until you're debugging live: token and origin rejection, the `no_client` path, code fences surviving the formatter unindented, and the DM guard refusing — plus a second sidecar with `denyDms: false` to check it then *serves*, including a notable-only drain of a DM coming back non-empty.
+Boots the real sidecar with a fake plugin standing in for Discord, then checks the things that are invisible until you're debugging live: token and origin rejection, the `no_client` path, code fences surviving the formatter unindented, and the DM guard refusing — plus a second sidecar with `denyDms: false` to check it then *serves*, including a notable-only drain of a DM coming back non-empty, and a third with a non-empty `allowDms` to check that scoping refuses an unlisted DM without leaking the body it refused. Three processes rather than restarts, because the config is read once at boot.
 
 The plugin half has no runtime tests — it needs a live client. Typecheck it against a real checkout instead:
 
 ```bash
-cd D:/Equicord && npx tsc --noEmit
+npm run typecheck:plugin -- --equicord=D:/Equicord
 ```
+
+Nothing else in this repo compiles that half. The sidecar's tsconfig covers `sidecar/src` only, and the plugin imports `@webpack/common`, which resolves nowhere but inside an Equicord tree. That config is also the stricter of the two, and the difference isn't academic — it's what caught an empty array literal widening to `never[]` on a change the sidecar build was perfectly happy with. The script copies the plugin in the way `install-plugin.ps1` does, runs Equicord's own `tsc`, and reports only diagnostics naming our folder: Equicord's tree doesn't always typecheck clean on its own, so the exit code is not a verdict on us.
 
 ## Scope and safety
 
@@ -240,7 +243,12 @@ Scope defaults, in `%APPDATA%\vesktop-claude-bridge\config.json`:
 
 - `denyDms: true` — "read my discord" shouldn't quietly mean all of it. Third eye has its own switch for the same question (see above); this one governs every tool, that one governs what the renderer will even buffer.
 - `allowGuilds: []` — set guild ids to restrict further. Empty means all.
+- `allowDms: []` — recipient ids whose DMs are readable, once `denyDms` is off. Empty means all of them, so this changes nothing until you fill it in. A group DM needs **every** member listed: reading it hands over what the others said too, and one allowlisted person in the room isn't consent from the other four.
 - `pseudonymize: false` — flip on to replace handles with `user_a`, `user_b` on the way out, so real handles never reach the model's context. Handy when the transcript is headed for a public repo.
+
+The config is read once, at startup, so a change here needs the sidecar restarted before it means anything — and when Claude Code is the thing spawning it, that means a new session.
+
+`allowDms` is matched against ids the plugin sends with the channel, so the two halves have to be in step: a plugin build older than this sidecar sends no recipient ids, and a non-empty `allowDms` then refuses every DM rather than waving them through. It says so when it does, and `discord_status` prints the DM scope it's actually running.
 
 ## Why it's read-only
 
@@ -254,6 +262,7 @@ If a write path is ever added, it should be draft-into-composer: the model write
 - [x] `discord_search` — guild search by text/author/mentions/attachment, with paging
 - [x] Third eye — watch a channel in the background, read it back on demand
 - [x] `discord_reactors` — expand a reaction count into the accounts behind it
+- [x] `discord_dms` — DM and group-DM listing with recipients, plus an `allowDms` allowlist
 - [ ] `discord_threads` — forum channel listing and thread reads
 - [ ] Mark ranges (shift-click two messages) rather than a fixed context window
 - [ ] Draft-into-composer write path

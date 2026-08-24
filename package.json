@@ -9,6 +9,7 @@
         "sync": "node scripts/sync-protocol.mjs",
         "build": "npm run sync && npm --prefix sidecar run build",
         "typecheck": "npm run sync && npm --prefix sidecar run typecheck",
+        "typecheck:plugin": "node scripts/typecheck-plugin.mjs",
         "test": "npm --prefix sidecar run test",
         "start": "npm --prefix sidecar run start",
         "install:sidecar": "npm --prefix sidecar install"

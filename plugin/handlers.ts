@@ -13,6 +13,7 @@ import {
     fetchMessages,
     fetchReactors,
     listChannels,
+    listDms,
     listGuilds,
     parseMessageLink,
     searchMessages,
@@ -183,6 +184,13 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
     async channels(params: RpcParams["channels"]): Promise<RpcResults["channels"]> {
         if (!params?.guildId) throw fail("bad_params", "guildId is required");
         return { channels: listChannels(params.guildId) };
+    },
+
+    // Takes no params: there is one private-channel list per account and nothing
+    // to scope it by. Reads the store only -- no REST -- so it is as cheap as
+    // `guilds` and can be called speculatively.
+    async dms(): Promise<RpcResults["dms"]> {
+        return { dms: listDms() };
     },
 
     async reactors(params: RpcParams["reactors"]): Promise<RpcResults["reactors"]> {

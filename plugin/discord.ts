@@ -33,6 +33,7 @@ import {
 import type {
     BridgeAttachment,
     BridgeChannel,
+    BridgeDm,
     BridgeEmbed,
     BridgeGuild,
     BridgeMessage,
@@ -172,16 +173,71 @@ export function toBridgeChannel(channel: any): BridgeChannel | null {
         guildId: channel.guild_id ? String(channel.guild_id) : null,
         parentId: channel.parent_id ? String(channel.parent_id) : null,
         isThread: THREAD_CHANNEL_TYPES.has(type),
-        isDm
+        isDm,
+        // DMs only. This is what the sidecar's `allowDms` list is matched
+        // against, and a guild channel has no recipients to match -- see the
+        // note on BridgeChannel.recipientIds for why it rides here at all.
+        recipientIds: isDm ? recipientIds(channel) : undefined
     };
 }
 
+/**
+ * The recipient ids on a private channel, as strings.
+ *
+ * Cached Channel records hold a bare array of ids; a REST channel payload holds
+ * whole user objects under the same key. Both are read, for the same reason
+ * every other mapper in this file reads two spellings of everything.
+ */
+function recipientIds(channel: any): string[] {
+    const raw: any[] = Array.isArray(channel?.recipients) ? channel.recipients : [];
+    return raw
+        .map(r => (r !== null && typeof r === "object" ? r.id : r))
+        .filter(id => id !== null && id !== undefined)
+        .map(id => String(id));
+}
+
+/**
+ * The people in a private channel, as users.
+ *
+ * `recipients` is only ids, so the names come from UserStore -- and when it has
+ * no record of somebody, from `rawRecipients`, which the channel record carries
+ * for exactly that case. A DM with someone you share no server with is the
+ * ordinary way to reach that branch, and it is also the DM most worth being
+ * able to find by name.
+ *
+ * Somebody neither store knows keeps their id rather than being dropped. A
+ * recipient list one name short is not a partial answer, it is a different
+ * channel -- and picking the wrong DM out of this list is the exact failure the
+ * `dms` method exists to stop.
+ */
+export function dmRecipients(channel: any): BridgeUser[] {
+    const known = new Map<string, any>();
+    const pools: any[][] = [
+        Array.isArray(channel?.recipients) ? channel.recipients : [],
+        Array.isArray(channel?.rawRecipients) ? channel.rawRecipients : []
+    ];
+    for (const pool of pools) {
+        for (const entry of pool) {
+            if (entry !== null && typeof entry === "object" && entry.id != null) {
+                known.set(String(entry.id), entry);
+            }
+        }
+    }
+
+    const out: BridgeUser[] = [];
+    for (const id of recipientIds(channel)) {
+        const raw = UserStore.getUser(id) ?? known.get(id);
+        out.push(
+            raw
+                ? toBridgeUser(raw, null)
+                : { id, username: `unknown(${id})`, displayName: `unknown(${id})`, bot: false }
+        );
+    }
+    return out;
+}
+
 function dmLabel(channel: any): string {
-    const ids: string[] = channel.recipients ?? [];
-    const names = ids
-        .map(id => UserStore.getUser(id))
-        .filter(Boolean)
-        .map((u: any) => u.username);
+    const names = dmRecipients(channel).map(u => u.username);
     return names.length ? `dm:${names.join(",")}` : "dm";
 }
 
@@ -739,6 +795,86 @@ export function listChannels(guildId: string): BridgeChannel[] {
     }
 
     return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * The account's DMs and group DMs, most recently active first.
+ *
+ * `listChannels` cannot answer this and never could: it goes through
+ * GuildChannelStore, which by construction only knows channels belonging to a
+ * guild. So the only route into a DM was `current_view` -- read whichever
+ * conversation happens to be on screen -- which is a coin flip that lands on
+ * somebody's private messages. That is not a hypothetical; it is why this
+ * method exists.
+ *
+ * Deliberately ChannelStore and not a PrivateChannelStore. Equicord's
+ * @webpack/common exports no store by that name (it has PrivateChannelSortStore,
+ * which sorts and does not hold), and private channels live on ChannelStore
+ * beside every other kind. `getSortedPrivateChannels()` is the client's own DM
+ * sidebar order, which is already by last message; `getMutablePrivateChannels()`
+ * is the fallback for a client that does not expose the sorted view, and has no
+ * order at all.
+ *
+ * Which is why the result is re-sorted here regardless. A caller promised "most
+ * recent first" has to be able to rely on it whichever branch answered, and
+ * sorting an already-sorted list of a few hundred entries costs nothing worth
+ * measuring.
+ */
+export function listDms(): BridgeDm[] {
+    const store: any = ChannelStore;
+    const sorted: any[] = store?.getSortedPrivateChannels?.() ?? [];
+    const channels: any[] = sorted.length
+        ? sorted
+        : Object.values(store?.getMutablePrivateChannels?.() ?? {});
+
+    // Annotated rather than inferred: an empty literal widens to never[] under
+    // Equicord's strict config, which the sidecar's tsconfig cannot catch
+    // because it never compiles this half.
+    const out: BridgeDm[] = [];
+    for (const channel of channels) {
+        const type = Number(channel?.type ?? -1);
+        // A private channel should only ever be a DM or a group DM, but this is
+        // Discord's store rather than ours, and the filter is load-bearing: a
+        // stray guild channel in here would be served as a DM.
+        if (!DM_CHANNEL_TYPES.has(type)) continue;
+        out.push({
+            id: String(channel.id),
+            type,
+            recipients: dmRecipients(channel),
+            // A one-to-one is never titled, so this is the group DM's name or
+            // nothing. Empty string collapses to null rather than rendering as
+            // a nameless separator in front of the recipients.
+            name: channel.name || null,
+            lastMessageId: channel.lastMessageId ? String(channel.lastMessageId) : null
+        });
+    }
+
+    return out.sort(byRecency);
+}
+
+/**
+ * Newest last message first, with channels that have none of their own last.
+ *
+ * Snowflakes sort chronologically but are strings that outgrow Number, so this
+ * goes through BigInt -- guarded, because a malformed id would otherwise throw
+ * inside a comparator and take the whole listing down with it. Array.sort is
+ * stable, so anything unplaceable keeps the store's order among itself.
+ */
+function byRecency(a: BridgeDm, b: BridgeDm): number {
+    const x = asSnowflake(a.lastMessageId);
+    const y = asSnowflake(b.lastMessageId);
+    if (x === null) return y === null ? 0 : 1;
+    if (y === null) return -1;
+    return x > y ? -1 : x < y ? 1 : 0;
+}
+
+function asSnowflake(id: string | null): bigint | null {
+    if (!id) return null;
+    try {
+        return BigInt(id);
+    } catch {
+        return null;
+    }
 }
 
 /**

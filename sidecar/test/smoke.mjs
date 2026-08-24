@@ -15,7 +15,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { connect as tcpConnect, createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -42,8 +42,16 @@ const WS_PORT_DM = 8901;
 const HTTP_PORT_DM = 8902;
 const BASE_DM = `http://127.0.0.1:${HTTP_PORT_DM}`;
 
+// And a third with DMs allowed but scoped to one recipient, which is the only
+// way to reach the `allowDms` branches: the sidecar above has an empty list, so
+// every DM clears it, and the primary refuses DMs before the list is consulted.
+const WS_PORT_ALLOW = 8903;
+const HTTP_PORT_ALLOW = 8904;
+const BASE_ALLOW = `http://127.0.0.1:${HTTP_PORT_ALLOW}`;
+
 const workDir = mkdtempSync(join(tmpdir(), "vcb-smoke-"));
 const workDirDm = mkdtempSync(join(tmpdir(), "vcb-smoke-dm-"));
+const workDirAllow = mkdtempSync(join(tmpdir(), "vcb-smoke-allow-"));
 
 let passed = 0;
 const failures = [];
@@ -65,7 +73,27 @@ const CHANNEL = {
     guildId: "1000", parentId: null, isThread: false, isDm: false
 };
 
-const DM_CHANNEL = { ...CHANNEL, id: "2999", name: "dm:bob", type: 1, guildId: null, isDm: true };
+const DM_CHANNEL = {
+    ...CHANNEL, id: "2999", name: "dm:bob", type: 1, guildId: null, isDm: true,
+    recipientIds: ["9002"]
+};
+
+// A second DM, whose recipient is deliberately not the allowlisted one.
+const DM_CHANNEL_OTHER = { ...DM_CHANNEL, id: "2998", name: "dm:cass", recipientIds: ["9003"] };
+
+/*
+ * What a plugin build older than the sidecar sends: a DM channel with no
+ * recipientIds key at all. Not an exotic case -- the two halves build in
+ * different trees, so this is the state the repo sits in between every pair of
+ * builds. A non-empty allowDms has nothing to match it against, and has to
+ * refuse rather than wave it through.
+ *
+ * Spread from CHANNEL rather than DM_CHANNEL so it cannot inherit the key it
+ * exists to be missing.
+ */
+const DM_CHANNEL_LEGACY = {
+    ...CHANNEL, id: "2997", name: "dm:legacy", type: 1, guildId: null, isDm: true
+};
 
 const OTHER_CHANNEL = { ...CHANNEL, id: "2001", name: "tech-support" };
 
@@ -205,6 +233,28 @@ const DM_THIRD_EYE_STATE = {
 
 const DM_LIVE = DM_MESSAGES.map(message => ({ message, notable: true, reason: "dm" }));
 
+/*
+ * The DM sidebar as the plugin sees it: two one-to-ones, a titled group DM, and
+ * one the client holds no last-message id for.
+ *
+ * Handed over in the order the plugin sorted them -- most recently active first
+ * -- because that sort is the plugin's job. It reads `lastMessageId` off channel
+ * records it already holds, and the sidecar's half is to render an order rather
+ * than to recompute one it has no timestamps for.
+ */
+const DMS = [
+    { id: "2998", type: 1, recipients: [user("9003", "Cass")], name: null, lastMessageId: "3600" },
+    {
+        id: "2996", type: 3, name: "pak crew", lastMessageId: "3400",
+        recipients: [user("9002", "Bob"), user("9003", "Cass")]
+    },
+    { id: "2999", type: 1, recipients: [user("9002", "Bob")], name: null, lastMessageId: "3002" },
+    // No last message at all, which is a different fact from "quiet lately": it
+    // cannot take part in the order above, and saying so beats parking it at the
+    // bottom where it reads as merely stale.
+    { id: "2995", type: 1, recipients: [user("9009", "Fen")], name: null, lastMessageId: null }
+];
+
 // --- fake plugin -----------------------------------------------------------
 
 function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS_PORT, dm = false } = {}) {
@@ -231,8 +281,17 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS
                 received[frame.method] = frame.params;
 
                 switch (frame.method) {
-                    case "history":
+                    case "history": {
+                        // A DM read, so the allowDms guard has something to act
+                        // on. Any other id is the standing guild fixture that
+                        // every block above asserts against.
+                        const dm = [DM_CHANNEL, DM_CHANNEL_OTHER, DM_CHANNEL_LEGACY]
+                            .find(c => c.id === frame.params?.channelId);
+                        if (dm) return answer({ channel: dm, messages: DM_MESSAGES });
                         return answer({ channel: CHANNEL, messages: [...MESSAGES, ...REPLY_GAPS, ...POLL_DAY] });
+                    }
+                    case "dms":
+                        return answer({ dms: DMS });
                     case "reactors":
                         return answer({
                             channel: CHANNEL, message: POLL_DAY[0],
@@ -386,6 +445,23 @@ const childDm = spawnSidecar({
 });
 
 /*
+ * `allowDms` has no env override, deliberately -- `allowGuilds` has none either,
+ * and a list of ids is not a flag. So this one gets a real config file, which is
+ * also the shape a user's own setup has. `denyDms` goes in the file too rather
+ * than the env, for no reason beyond keeping one scope decision in one place.
+ */
+writeFileSync(
+    join(workDirAllow, "config.json"),
+    JSON.stringify({ denyDms: false, allowDms: ["9002"] }, null, 4),
+    "utf8"
+);
+const childAllow = spawnSidecar({
+    wsPort: WS_PORT_ALLOW,
+    httpPort: HTTP_PORT_ALLOW,
+    dir: workDirAllow
+});
+
+/*
  * The re-election candidates, spawned late so they can't win the first bind.
  * Held at module scope purely so cleanup() can reach them: a promoted candidate
  * outlives this run holding both primary ports and breaks the next invocation of
@@ -412,10 +488,11 @@ function spawnCandidate(level = "info") {
 function cleanup(code) {
     child.kill();
     childDm.kill();
+    childAllow.kill();
     for (const proc of candidates) proc.kill();
     try { squatter?.close(); } catch { /* already closed */ }
     try { standIn?.close(); } catch { /* already closed */ }
-    for (const dir of [workDir, workDirDm]) {
+    for (const dir of [workDir, workDirDm, workDirAllow]) {
         try { rmSync(dir, { recursive: true, force: true }); } catch { /* windows file locks */ }
     }
     process.exit(code);
@@ -655,6 +732,15 @@ try {
     check("a refused read never asked the plugin to consume", received["marked.list"]?.consume === false);
     check("a refused read does not empty the queue", received["marked.clear"] === undefined);
 
+    // The listing is itself the disclosure -- handles, account ids and who the
+    // user talks to most, with no message body anywhere in it. Serving it under
+    // denyDms would hand over the address book while withholding the letters.
+    const dmsDenied = await get("/dms");
+    check("listing DMs is refused when DMs are denied", dmsDenied.status === 403, `got ${dmsDenied.status}`);
+    const dmsDeniedBody = await dmsDenied.text();
+    check("and names the setting", dmsDeniedBody.includes("denyDms"));
+    check("and does not name a single recipient", !dmsDeniedBody.includes("Bob"));
+
     console.log("\nscope guard, opened (denyDms: false)");
     if (!(await waitForPort(BASE_DM))) {
         check("the second sidecar came up", false, "it never started");
@@ -702,6 +788,100 @@ try {
         check("renders stamps in the configured zone", liveDmBody.includes("2026-08-01 10:31:02"));
         check("and leaves no UTC clock behind", !liveDmBody.includes("14:31:02"));
         check("and says which zone that was", liveDmBody.includes("times in America/New_York"));
+
+        /*
+         * The whole of feature A. `channels` goes through GuildChannelStore,
+         * which by construction cannot see a DM, so before this there was no way
+         * to go from "the DM with Bob" to a channel id except current_view --
+         * read whatever is on screen, and hope it is the right conversation.
+         */
+        const dmList = await getFrom(BASE_DM, "/dms");
+        check("the DM list is served when DMs are allowed", dmList.status === 200, `got ${dmList.status}`);
+        const dmListBody = await dmList.text();
+        check("counts them and says what the order is", dmListBody.includes("── 4 direct messages · most recently active first"));
+        check("names the recipient beside the channel id", /\n2998 +dm +Cass\n/.test(dmListBody), dmListBody);
+        check("labels a group DM as one, and keeps its title", /\n2996 +group-dm +pak crew · Bob, Cass\n/.test(dmListBody));
+        check(
+            "keeps the plugin's most-recently-active-first order",
+            dmListBody.indexOf("2998") < dmListBody.indexOf("2996") &&
+                dmListBody.indexOf("2996") < dmListBody.indexOf("2999"),
+            dmListBody
+        );
+        // "No last message" is not "quiet lately", and the difference is whether
+        // its position in the list means anything at all.
+        check(
+            "says a DM with no last message cannot be placed in that order",
+            /\n2995 +dm +Fen · no last message, so unplaced in the order above\n/.test(dmListBody)
+        );
+        check("omits account ids by default", !dmListBody.includes("⟨9002⟩"));
+        check(
+            "ids=1 adds them, which is what discord_search authorId= wants",
+            (await (await getFrom(BASE_DM, "/dms?ids=1")).text()).includes("Bob ⟨9002⟩")
+        );
+        check("and nothing was withheld with an empty allowDms", !dmListBody.includes("withheld"));
+
+        // The default the user is actually running: DMs on, no allowlist. An
+        // empty allowDms must go on meaning every DM, or this change breaks a
+        // working setup while claiming to narrow one.
+        const openDm = await getFrom(BASE_DM, "/history?channelId=2998");
+        check("an empty allowDms still serves every DM", openDm.status === 200, `got ${openDm.status}`);
+        check("and one with no recipient ids at all", (await getFrom(BASE_DM, "/history?channelId=2997")).status === 200);
+    }
+
+    console.log("\nallowDms (scoped to named people, not all-or-nothing)");
+    if (!(await waitForPort(BASE_ALLOW))) {
+        check("the allowDms sidecar came up", false, "it never started");
+    } else {
+        await fakePlugin({ wsPort: WS_PORT_ALLOW });
+
+        const allowList = await getFrom(BASE_ALLOW, "/dms");
+        check("the listing is served", allowList.status === 200, `got ${allowList.status}`);
+        const allowListBody = await allowList.text();
+        check("and shows the allowlisted DM", /\n2999 +dm +Bob\n/.test(allowListBody), allowListBody);
+        check("and not the unlisted one", !allowListBody.includes("2998"));
+        // Being on the list is not something one person can consent to on four
+        // people's behalf, so `every` rather than `some`.
+        check(
+            "a group DM with one unlisted member is not allowlisted by the other",
+            !allowListBody.includes("2996")
+        );
+        check(
+            "and what was withheld is counted rather than dropped",
+            allowListBody.includes("3 withheld by the sidecar's allowDms list"),
+            allowListBody
+        );
+
+        const allowedRead = await getFrom(BASE_ALLOW, "/history?channelId=2999");
+        check("reading the allowlisted DM is served", allowedRead.status === 200, `got ${allowedRead.status}`);
+        check("and carries the body", (await allowedRead.text()).includes("did the pak actually load"));
+
+        const refusedRead = await getFrom(BASE_ALLOW, "/history?channelId=2998");
+        check("reading an unlisted DM is refused", refusedRead.status === 403, `got ${refusedRead.status}`);
+        const refusedBody = await refusedRead.text();
+        check("and names the setting", refusedBody.includes("allowDms"));
+        // A refusal that will not say what to add is a dead end, which is why the
+        // guild refusal beside it already names the guild id.
+        check("and names the id that would open it", refusedBody.includes("9003"));
+        check("and does not leak the body it refused", !refusedBody.includes("did the pak actually load"));
+
+        // Fails closed. An allowlist that waves through what it cannot check is
+        // not an allowlist, and the plugin half being the older one is routine.
+        const legacyRead = await getFrom(BASE_ALLOW, "/history?channelId=2997");
+        check("a DM carrying no recipient ids is refused, not waved through", legacyRead.status === 403, `got ${legacyRead.status}`);
+        const legacyBody = await legacyRead.text();
+        check("and says the plugin may be the older half", legacyBody.includes("rebuild the plugin"));
+        check("rather than blaming the config", !legacyBody.includes("Add that id"));
+
+        // allowDms narrows the DM side and nothing else.
+        check(
+            "a guild channel is untouched by allowDms",
+            (await getFrom(BASE_ALLOW, "/history?channelId=2000")).status === 200
+        );
+
+        // Otherwise a listing that came back one entry long has no explanation
+        // anywhere, which is the shape a scope config bug hides in.
+        const allowStatus = await (await getFrom(BASE_ALLOW, "/status")).json();
+        check("status publishes the list so a short answer is explicable", allowStatus.scope?.allowDms?.[0] === "9002");
     }
 
     console.log("\nreply gaps");
