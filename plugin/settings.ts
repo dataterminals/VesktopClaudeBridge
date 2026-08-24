@@ -7,6 +7,8 @@ import { definePluginSettings } from "@api/Settings";
 import { localStorage } from "@utils/localStorage";
 import { OptionType } from "@utils/types";
 
+import { clearSession } from "./dmLedger";
+import { DmAllowList } from "./dmSettings";
 import { DEFAULT_PORT } from "./protocol";
 
 /**
@@ -103,6 +105,40 @@ export const settings = definePluginSettings({
         description:
             "Third eye: allow watching DMs. Off by default — \"read my Discord\" shouldn't quietly mean all of it. The sidecar keeps its own switch: set \"denyDms\": false in its config too, or the buffer fills and then the drain is refused at the boundary.",
         default: false
+    },
+    dmAccess: {
+        type: OptionType.SELECT,
+        description:
+            "What happens when something asks to read one of your DMs. This gate lives in Discord, so it refuses before anything leaves the client at all — unlike the sidecar's denyDms, which refuses content that has already crossed over.",
+        options: [
+            {
+                label: "Ask me each time (recommended)",
+                value: "ask",
+                default: true
+            },
+            {
+                label: "Always allow — no prompt, every DM readable",
+                value: "allow"
+            },
+            {
+                label: "Off — refuse every DM, ignoring anything allowed below",
+                value: "off"
+            }
+        ],
+        // Grants are consent given under one set of rules, and the rules just
+        // moved. Flipping to Off and back to Ask must not silently restore an
+        // hour of access agreed to beforehand.
+        onChange: () => clearSession()
+    },
+    dmGrantMinutes: {
+        type: OptionType.NUMBER,
+        description:
+            "How long the Allow button on that prompt lasts, in minutes. Grants are held in memory only, so reloading Discord revokes every one of them regardless.",
+        default: 60
+    },
+    dmAllowList: {
+        type: OptionType.COMPONENT,
+        component: DmAllowList
     }
 });
 

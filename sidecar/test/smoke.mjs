@@ -95,6 +95,34 @@ const DM_CHANNEL_LEGACY = {
     ...CHANNEL, id: "2997", name: "dm:legacy", type: 1, guildId: null, isDm: true
 };
 
+/*
+ * Two DMs the fake plugin refuses on its own, standing in for the plugin-side
+ * consent gate in plugin/dmConsent.ts.
+ *
+ * Nothing here exercises the prompt -- that needs a renderer, and the plugin
+ * half has never had runtime tests. What these pin is the half that runs in this
+ * process: a refusal raised *before* the plugin read anything has to arrive as a
+ * 403 with its message intact, because that message is the entire user
+ * interface for the gate. It names which of four switches refused and where to
+ * change it, and the second one instructs the model to retry rather than to give
+ * up. Either one arriving mangled, truncated or downgraded to a generic
+ * "forbidden" turns a working feature into a dead end.
+ *
+ * The text is deliberately a fixture rather than the plugin's real wording --
+ * this asserts the pipe, not the prose, and coupling to the copy would make
+ * every reworded refusal a test failure.
+ */
+const GATED_CHANNEL = { ...DM_CHANNEL, id: "2993", name: "dm:gated" };
+const GATE_REFUSAL =
+    "Refused by the Discord plugin: DM access is switched off, so Bob cannot be read. " +
+    "This is the plugin's own switch, separate from the sidecar's \"denyDms\".";
+
+const PENDING_CHANNEL = { ...DM_CHANNEL, id: "2992", name: "dm:pending" };
+const PENDING_REFUSAL =
+    "A confirmation for Bob is on screen in Discord and has not been answered yet. " +
+    "It is still up -- the user can approve it there and this call will work on the next attempt. " +
+    "Nothing has been read.";
+
 const OTHER_CHANNEL = { ...CHANNEL, id: "2001", name: "tech-support" };
 
 const GUILD = { id: "1000", name: "Test Server" };
@@ -285,6 +313,20 @@ function fakePlugin({ token = TOKEN, origin = "https://discord.com", wsPort = WS
                         // A DM read, so the allowDms guard has something to act
                         // on. Any other id is the standing guild fixture that
                         // every block above asserts against.
+                        // Refused by the plugin before it read anything, which is
+                        // what the consent gate does. No channel, no messages --
+                        // the point is that nothing was fetched to refuse.
+                        const gate = [
+                            [GATED_CHANNEL.id, GATE_REFUSAL],
+                            [PENDING_CHANNEL.id, PENDING_REFUSAL]
+                        ].find(([id]) => id === frame.params?.channelId);
+                        if (gate) {
+                            return socket.send(JSON.stringify({
+                                t: "res", id: frame.id, ok: false,
+                                error: { code: "forbidden", message: gate[1] }
+                            }));
+                        }
+
                         const dm = [DM_CHANNEL, DM_CHANNEL_OTHER, DM_CHANNEL_LEGACY]
                             .find(c => c.id === frame.params?.channelId);
                         if (dm) return answer({ channel: dm, messages: DM_MESSAGES });
@@ -826,6 +868,32 @@ try {
         const openDm = await getFrom(BASE_DM, "/history?channelId=2998");
         check("an empty allowDms still serves every DM", openDm.status === 200, `got ${openDm.status}`);
         check("and one with no recipient ids at all", (await getFrom(BASE_DM, "/history?channelId=2997")).status === 200);
+
+        /*
+         * The plugin-side consent gate, from this side of the socket.
+         *
+         * Deliberately run against the sidecar whose own DM guards are wide open
+         * (denyDms off, allowDms empty), so a 403 here can only have come from
+         * the plugin. That is the whole claim being tested: a gate the sidecar
+         * knows nothing about still refuses, and its reasoning reaches the caller
+         * rather than being flattened into a generic error.
+         */
+        const gated = await getFrom(BASE_DM, "/history?channelId=2993");
+        check("a refusal from the plugin's own gate becomes a 403", gated.status === 403, `got ${gated.status}`);
+        const gatedBody = await gated.text();
+        check("and arrives word for word", gatedBody.includes(GATE_REFUSAL), gatedBody);
+        check("and says which of the four switches refused", gatedBody.includes("the plugin's own switch"));
+        check("and carries no message body with it", !gatedBody.includes("did the pak actually load"));
+
+        // The one refusal that is an instruction rather than a verdict. If this
+        // reaches the model as a bare "forbidden" it reads as permanent, and the
+        // click that would have fixed it never gets asked for.
+        const pending = await getFrom(BASE_DM, "/history?channelId=2992");
+        check("an unanswered prompt is refused too", pending.status === 403, `got ${pending.status}`);
+        const pendingBody = await pending.text();
+        check("and says the prompt is still on screen", pendingBody.includes("still up"));
+        check("and that retrying is the way through", pendingBody.includes("next attempt"));
+        check("and that nothing was read in the meantime", pendingBody.includes("Nothing has been read"));
     }
 
     console.log("\nallowDms (scoped to named people, not all-or-nothing)");

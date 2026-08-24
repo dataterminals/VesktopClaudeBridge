@@ -153,6 +153,8 @@ The buffer starts empty, so it never contains what led up to its first message. 
 
 **DMs need two switches, and they are deliberately separate.** Set **Third eye watch DMs** in the plugin settings to let the buffer fill from a DM at all, and `denyDms: false` in the sidecar config to let that content leave the renderer. Flip only the first and the buffer fills correctly and then the drain is refused at the boundary; flip only the second and the button still won't arm. The split is the point — the plugin setting decides what is *collected*, the sidecar decides what reaches a model — but it does mean a half-configured setup fails in two different-looking ways.
 
+Draining a DM watch also goes through the confirmation prompt described under [DM access](#dm-access), like any other DM read. Arming it doesn't — capture is free and never leaves the client, and the prompt belongs at the point where something is actually about to be read.
+
 Inside a DM every message counts as notable, because a one-to-one has no ambient tier to sort against: nobody @-mentions you or uses the reply affordance, so the guild rules would find nothing to fire on and the notable-only hook below would stay silent while the buffer filled. Group DMs count the same way.
 
 For the button alone to be enough, register the hook — otherwise you'd have to tell Claude the watch is running once per session:
@@ -163,6 +165,32 @@ For the button alone to be enough, register the hook — otherwise you'd have to
 ```
 
 It runs on every message you send, times out after 2s, exits 0 on every failure path, and prints nothing when there's nothing to say.
+
+## DM access
+
+Three gates stand between a private conversation and a model, across two processes. They aren't redundant: each refuses at a different point, and the earliest one is the strongest.
+
+**In Discord, under the plugin's settings** — *DM access*, which is the one you'll actually use:
+
+- **Ask me each time** (the default) — a confirmation appears in Discord naming the conversation, offering *Allow for 60 min*, *Always allow*, or *Deny*. Nothing has been read at the moment you're asked. This gate sits in front of the RPC handler, so a refusal means the message bodies were never fetched, never serialised, and never put on the socket.
+- **Always allow** — no prompt. What the bridge did before this existed.
+- **Off** — every DM refused, the `discord_dms` listing included, and including anything on the permanent allowlist. This is the switch that overrides the others.
+
+Temporary grants are held in memory and never written to disk, so `Ctrl+R` revokes every one of them. *Always allow* writes to IndexedDB — deliberately **not** to plugin settings, because Vencord's cloud settings sync uploads that blob wholesale, and a list of who you DM shouldn't leave the machine. Same reasoning that keeps the bridge token in `localStorage`. The permanently-allowed list renders in the plugin settings with a revoke button per entry: a permission you can't find again is a change of default, not a grant.
+
+Declining puts that conversation on a five-minute cooldown. Without one, an agent that retries on refusal reopens the prompt immediately, and the only way out is to allow the thing you just refused.
+
+**In the sidecar config** — `denyDms` and `allowDms`, under [Scope and safety](#scope-and-safety). Those refuse content that has already crossed the process boundary, which is exactly why they're the weaker pair.
+
+### When the prompt goes unanswered
+
+The bridge holds the call open for 10 seconds. Past that it answers *"a confirmation is on screen in Discord"* and **leaves the prompt up** — clicking Allow afterwards still works, and the next attempt goes straight through.
+
+That bound exists because the sidecar's `rpcTimeoutMs` defaults to 15s. A modal waiting on a human outlasts that easily, and the tool then reports `timeout`, which reads as "the bridge is broken" rather than "you haven't clicked yet" — and sends you debugging instead of answering. **Lower `rpcTimeoutMs` below 10s and you get that timeout back.**
+
+### The one thing that isn't gated
+
+`third_eye.state` reports *which* channel is being watched, DM or not, with no prompt. It carries no message bodies, and it's open deliberately: the sidecar calls it precisely so it can refuse *before* draining the buffer, and gating the probe would break the ordering that stops a refused drain destroying the very thing it was refusing to show. Arming a DM watch already requires turning on **Third eye watch DMs**, which is off by default, so that channel has been opted into twice before this can say anything about it. The drain — where the content actually is — is gated normally.
 
 ## Living with it
 
@@ -227,6 +255,8 @@ npm test
 
 Boots the real sidecar with a fake plugin standing in for Discord, then checks the things that are invisible until you're debugging live: token and origin rejection, the `no_client` path, code fences surviving the formatter unindented, and the DM guard refusing — plus a second sidecar with `denyDms: false` to check it then *serves*, including a notable-only drain of a DM coming back non-empty, and a third with a non-empty `allowDms` to check that scoping refuses an unlisted DM without leaking the body it refused. Three processes rather than restarts, because the config is read once at boot.
 
+It also pins that a refusal from the *plugin's* consent gate survives the trip: 403, message word for word, no body attached. The prompt itself can't be tested from here — that needs a renderer — but the refusal text is the entire user interface for that gate, and one of the two refusals is an instruction to retry rather than a verdict. Flattened into a generic `forbidden`, it would read as permanent and the click that fixes it would never get asked for.
+
 The plugin half has no runtime tests — it needs a live client. Typecheck it against a real checkout instead:
 
 ```bash
@@ -238,6 +268,8 @@ Nothing else in this repo compiles that half. The sidecar's tsconfig covers `sid
 ## Scope and safety
 
 A websocket on loopback has no same-origin protection — any page you visit can open one. Two things stop that page reading your Discord: it can't read the token (so it can't authenticate), and it can't forge an `Origin` header. Both are checked; either alone would do.
+
+These two are the sidecar's half. The plugin has its own DM gate that refuses earlier and overrides both — see [DM access](#dm-access).
 
 Scope defaults, in `%APPDATA%\vesktop-claude-bridge\config.json`:
 
@@ -263,6 +295,7 @@ If a write path is ever added, it should be draft-into-composer: the model write
 - [x] Third eye — watch a channel in the background, read it back on demand
 - [x] `discord_reactors` — expand a reaction count into the accounts behind it
 - [x] `discord_dms` — DM and group-DM listing with recipients, plus an `allowDms` allowlist
+- [x] Per-DM consent prompts in the client, with temporary and permanent grants
 - [ ] `discord_threads` — forum channel listing and thread reads
 - [ ] Mark ranges (shift-click two messages) rather than a fixed context window
 - [ ] Draft-into-composer write path

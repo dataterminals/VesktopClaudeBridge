@@ -24,6 +24,7 @@ import {
     toBridgeGuild,
     toBridgeMessage
 } from "./discord";
+import { loadDmLedger } from "./dmLedger";
 import { handlers, snapshotCurrentChannel } from "./handlers";
 import { type CopyableId, messageHome, messageIds, noun } from "./ids";
 import { addMark, clearMarks, loadMarks, markCount } from "./marked";
@@ -478,6 +479,10 @@ export default definePlugin({
         drainTokenInbox();
         await loadMarks();
         await loadThirdEye();
+        // Before the socket is dialled below, or the first RPC through the door
+        // could be gated against an allowlist that had not finished loading --
+        // which fails closed, so it would prompt for something already allowed.
+        await loadDmLedger();
         refreshTerms();
 
         setCallbacks(

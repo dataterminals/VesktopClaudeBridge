@@ -9,6 +9,7 @@
  * side answering.
  */
 
+import { requestDmAccess } from "./dmConsent";
 import {
     PROTOCOL_VERSION,
     type BridgeUser,
@@ -161,6 +162,20 @@ export class BridgeClient {
         }
 
         try {
+            /*
+             * The DM gate, sited here and nowhere else.
+             *
+             * Ahead of the handler rather than inside each one, so a private
+             * conversation is refused before anything reads it, serialises it or
+             * puts it on this socket. The sidecar's equivalent guard is called
+             * from fifteen places and has twice been found sitting downstream of
+             * one of two exits; one call site cannot drift like that.
+             *
+             * It throws an RpcError, which the catch below already turns into a
+             * refusal frame -- so this needs no error handling of its own.
+             */
+            await requestDmAccess(frame.method, frame.params);
+
             const data = await handler(frame.params);
             socket.send(JSON.stringify({ t: "res", id: frame.id, ok: true, data }));
         } catch (err) {
