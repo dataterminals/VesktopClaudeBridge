@@ -113,11 +113,23 @@ Required plugins (`BadgeAPI`, `NoticesAPI`, `ContextMenuAPI`, `SupportHelper`) d
 
 ### 3. Wire up MCP
 
+Build first — step 1, if you skipped it. The path below points into `sidecar/dist/`, which is gitignored and so isn't in a fresh clone, and a registration aimed at a file that doesn't exist fails at session start with no obvious error.
+
 ```bash
-claude mcp add discord -- node "D:/Github Repositories/VesktopClaudeBridge/sidecar/dist/index.js"
+claude mcp add -s user discord -- node "D:/Github Repositories/VesktopClaudeBridge/sidecar/dist/index.js"
 ```
 
-Check it took with `discord_status`. If it says `no_client`, Vesktop isn't running or the plugin isn't enabled.
+Substitute your own checkout path. Use `-s user`, or it is scoped to whichever directory you happened to run the command in and silently will not load anywhere else — `discord_status` then comes back missing in every other project, with nothing on screen to say why.
+
+**In Windows PowerShell**, `claude` resolves to `claude.ps1`, and the parameter binder consumes the bare `--` before the script ever sees it, so the subprocess command arrives stripped of its separator and the `node ...` half is read as more arguments to `claude mcp add`. Quote the separator to get it through:
+
+```powershell
+claude mcp add -s user discord '--' node "D:/Github Repositories/VesktopClaudeBridge/sidecar/dist/index.js"
+```
+
+Only `--` is eaten; `-s` and the rest pass through fine. The stop-parsing token `--%` does *not* help here: it applies only to native commands, so against a `.ps1` shim it is passed through as a literal argument and everything after it collapses into a single string. `claude.cmd --% ...` does work, since that one is native.
+
+Verify with `claude mcp get discord`; remove with `claude mcp remove discord -s user`. Then check the bridge itself with `discord_status` — if it says `no_client`, Vesktop isn't running or the plugin isn't enabled.
 
 Start it by hand with `npm start` if you want one running independently — otherwise Claude Code spawns it for you when a session begins.
 
