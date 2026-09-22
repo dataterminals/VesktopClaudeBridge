@@ -24,7 +24,10 @@ import {
     compactMessages,
     dmAllowed,
     renderDms,
+    renderMembers,
+    renderPollVoters,
     renderReactors,
+    renderRoles,
     renderSearchResults,
     renderTranscript,
     zoneNote
@@ -548,6 +551,64 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                     );
                 }
 
+                case "/poll-voters": {
+                    const channelId = q.get("channelId");
+                    const messageId = q.get("messageId");
+                    if (!channelId || !messageId) return send(res, 400, "missing channelId or messageId\n");
+                    const out = await bridge.call("pollVoters", {
+                        channelId,
+                        messageId,
+                        answerId: q.has("answerId") ? Number.parseInt(q.get("answerId")!, 10) : undefined,
+                        limit: q.has("limit") ? Number.parseInt(q.get("limit")!, 10) : undefined
+                    });
+                    assertAllowed(cfg, out.channel);
+                    if (!out.message) return send(res, 404, "no such message\n");
+                    if (wantJson) return sendJson(res, 200, out);
+                    return send(
+                        res,
+                        200,
+                        renderPollVoters(
+                            {
+                                channel: out.channel,
+                                message: pseudo.apply([out.message])[0]!,
+                                answers: out.answers.map(a => ({ ...a, users: pseudo.applyUsers(a.users) })),
+                                skipped: out.skipped
+                            },
+                            { timezone: cfg.timezone, ids: q.has("ids") }
+                        ) + "\n"
+                    );
+                }
+
+                case "/members": {
+                    const guildId = q.get("guildId");
+                    if (!guildId) return send(res, 400, "missing guildId\n");
+                    if (cfg.allowGuilds.length && !cfg.allowGuilds.includes(guildId)) {
+                        return send(res, 403, `forbidden: guild ${guildId} is not allowlisted\n`);
+                    }
+                    const out = await bridge.call("members", {
+                        guildId,
+                        roleId: q.get("roleId") ?? undefined,
+                        query: q.get("query") ?? undefined,
+                        limit: q.has("limit") ? Number.parseInt(q.get("limit")!, 10) : undefined
+                    });
+                    if (wantJson) return sendJson(res, 200, out);
+                    const members = out.members.map(m => ({
+                        ...m,
+                        ...pseudo.applyUsers([{ id: m.id, username: m.username, displayName: m.displayName, bot: m.bot }])[0]!
+                    }));
+                    return send(res, 200, renderMembers({ ...out, members }, { ids: q.has("ids") }) + "\n");
+                }
+
+                case "/roles": {
+                    const guildId = q.get("guildId");
+                    if (!guildId) return send(res, 400, "missing guildId\n");
+                    if (cfg.allowGuilds.length && !cfg.allowGuilds.includes(guildId)) {
+                        return send(res, 403, `forbidden: guild ${guildId} is not allowlisted\n`);
+                    }
+                    const out = await bridge.call("roles", { guildId });
+                    return wantJson ? sendJson(res, 200, out) : send(res, 200, renderRoles(out) + "\n");
+                }
+
                 case "/attachment": {
                     const channelId = q.get("channelId");
                     const messageId = q.get("messageId");
@@ -555,10 +616,11 @@ export async function startHttpApi(bridge: Bridge, cfg: Config): Promise<Server>
                     const out = await bridge.call("history", { channelId, around: messageId, limit: 3 });
                     assertAllowed(cfg, out.channel);
                     const message = out.messages.find(m => m.id === messageId);
+                    // A forward carries its attachments inside `forwarded`, not
+                    // `attachments` — the message itself is usually empty besides it.
+                    const pool = message ? message.attachments.concat(message.forwarded?.attachments ?? []) : [];
                     const name = q.get("filename");
-                    const att = name
-                        ? message?.attachments.find(a => a.filename === name)
-                        : message?.attachments[0];
+                    const att = name ? pool.find(a => a.filename === name) : pool[0];
                     if (!att) return send(res, 404, "no such attachment\n");
                     const saved = await fetchAttachment(cfg, att, messageId);
                     return wantJson

@@ -31,6 +31,14 @@ export interface BridgeUser {
     /** Server nickname if present, else global display name, else username. */
     displayName: string;
     bot: boolean;
+    /**
+     * Resolved role names, for a guild message's author. Absent in a DM, where
+     * there is no guild to hold roles at all — not the same as "holds none".
+     *
+     * Optional because a plugin build older than the sidecar does not send it,
+     * same convention as every other field added after this project's first cut.
+     */
+    roles?: string[];
 }
 
 export interface BridgeAttachment {
@@ -76,6 +84,10 @@ export interface BridgePollAnswer {
     /** Discord's per-poll answer id. `count` is keyed by this, not by position. */
     id: number;
     text: string | null;
+    /** Same shape as BridgeReaction.emoji: `:name:` for custom, the glyph itself for unicode. */
+    emoji: string | null;
+    /** Set for a custom emoji, same reasoning as BridgeReaction.emojiId. */
+    emojiId: string | null;
     /**
      * Votes for this answer, or null when Discord sent no tally at all.
      *
@@ -135,6 +147,21 @@ export interface ReactorGroup {
     error?: string | null;
 }
 
+/** One poll answer's worth of voters, as returned by the `pollVoters` method. */
+export interface PollAnswerVoters {
+    answerId: number;
+    text: string | null;
+    emoji: string | null;
+    emojiId: string | null;
+    /** What the poll's tally says — null when Discord sent no tally at all. */
+    count: number | null;
+    users: BridgeUser[];
+    /** More people voted than were fetched; raise `limit` to page further. */
+    truncated: boolean;
+    /** Same convention as ReactorGroup.error — why the list is short, not just that it is. */
+    error?: string | null;
+}
+
 export interface BridgeReplyRef {
     id: string | null;
     author: string | null;
@@ -142,6 +169,29 @@ export interface BridgeReplyRef {
     excerpt: string | null;
     /** True when Discord did not give us the referenced message body. */
     unresolved: boolean;
+}
+
+/**
+ * A forwarded message's own content, distinct from `BridgeReplyRef`.
+ *
+ * A forward is not a reply with an excerpt: Discord ships the whole forwarded
+ * message (body, attachments, embeds) as a `message_snapshots` entry, and the
+ * `message_reference` beside it points at the *origin* channel/guild rather than
+ * one already open in this page. No author field on purpose — Discord's forward
+ * payload does not carry the original sender either.
+ */
+export interface BridgeForward {
+    content: string;
+    attachments: BridgeAttachment[];
+    embeds: BridgeEmbed[];
+    /** ISO 8601, or null when the snapshot carried no timestamp. */
+    timestamp: string | null;
+    originChannelId: string | null;
+    /** Best-effort — only set when the client already has that channel cached. */
+    originChannelName: string | null;
+    originGuildId: string | null;
+    /** Best-effort — only set when the client already has that guild cached. */
+    originGuildName: string | null;
 }
 
 export interface BridgeMessage {
@@ -158,6 +208,8 @@ export interface BridgeMessage {
      */
     content: string;
     replyTo: BridgeReplyRef | null;
+    /** Present when this message is a forward rather than a reply — never both. */
+    forwarded: BridgeForward | null;
     attachments: BridgeAttachment[];
     embeds: BridgeEmbed[];
     reactions: BridgeReaction[];
@@ -241,6 +293,36 @@ export interface BridgeDm {
 export interface BridgeGuild {
     id: string;
     name: string;
+}
+
+/**
+ * One member of a guild, as the client's own cache happens to hold them.
+ *
+ * Discord only streams *online* members to a normal account once a guild
+ * passes roughly a thousand of them, so `members` is never a full roster on a
+ * large server — it is whatever the client has loaded, which the renderer
+ * says outright rather than presenting as complete.
+ */
+export interface BridgeMember {
+    id: string;
+    username: string;
+    displayName: string;
+    bot: boolean;
+    /** Resolved role names, not ids — same convention as BridgeUser.roles. */
+    roles: string[];
+    /** ISO 8601, or null when the client's cache didn't carry one. */
+    joinedAt: string | null;
+}
+
+export interface BridgeRole {
+    id: string;
+    name: string;
+    /** Raw integer colour, 0 for "no colour" (Discord's own default role colour). */
+    color: number;
+    /** Sort position — higher is closer to the top of the role list. */
+    position: number;
+    /** Shown separately in the member sidebar rather than lumped under "online". */
+    hoist: boolean;
 }
 
 export interface CurrentView {
@@ -350,7 +432,10 @@ export type RpcMethod =
     | "guilds"
     | "channels"
     | "dms"
-    | "reactors";
+    | "reactors"
+    | "pollVoters"
+    | "members"
+    | "roles";
 
 export interface RpcParams {
     ping: Record<string, never>;
@@ -405,6 +490,23 @@ export interface RpcParams {
         /** Users to collect per reaction. Discord pages these 100 at a time. */
         limit?: number;
     };
+    pollVoters: {
+        channelId: string;
+        messageId: string;
+        /** Which answer to expand, by its numeric id. Omit to expand every answer on the poll. */
+        answerId?: number;
+        /** Voters to collect per answer. Discord pages these 100 at a time. */
+        limit?: number;
+    };
+    members: {
+        guildId: string;
+        /** Only members holding this role id. */
+        roleId?: string;
+        /** Case-insensitive substring match against username or nickname. */
+        query?: string;
+        limit?: number;
+    };
+    roles: { guildId: string; };
 }
 
 export interface RpcResults {
@@ -470,6 +572,29 @@ export interface RpcResults {
          * short one that says so.
          */
         skipped: number;
+    };
+    pollVoters: {
+        channel: BridgeChannel | null;
+        /** The message itself, so a caller can see what poll this was. */
+        message: BridgeMessage | null;
+        answers: PollAnswerVoters[];
+        /**
+         * Answers left unexpanded because the poll carried more than one call
+         * will walk. Same convention as `reactors.skipped`.
+         */
+        skipped: number;
+    };
+    members: {
+        guild: BridgeGuild | null;
+        members: BridgeMember[];
+        /** How many members matched `roleId`/`query` before `limit` cut the list. */
+        scanned: number;
+        /** More matched than `limit` returned; narrow the filter or raise it. */
+        truncated: boolean;
+    };
+    roles: {
+        guild: BridgeGuild | null;
+        roles: BridgeRole[];
     };
 }
 

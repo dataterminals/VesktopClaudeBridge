@@ -23,7 +23,10 @@ import {
     compactMessages,
     dmAllowed,
     renderDms,
+    renderMembers,
+    renderPollVoters,
     renderReactors,
+    renderRoles,
     renderSearchResults,
     renderTranscript,
     zoneNote
@@ -630,20 +633,21 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                         new BridgeError({ code: "not_found", message: `Message ${messageId} was not found in ${channelId}.` })
                     );
                 }
-                if (!message.attachments.length) {
+                // A forward carries its attachments inside `forwarded`, not
+                // `attachments` — the message itself is usually empty besides it.
+                const pool = message.attachments.concat(message.forwarded?.attachments ?? []);
+                if (!pool.length) {
                     return failure(
                         new BridgeError({ code: "not_found", message: `Message ${messageId} has no attachments.` })
                     );
                 }
 
-                const wanted = filename
-                    ? message.attachments.find(a => a.filename === filename)
-                    : message.attachments[0];
+                const wanted = filename ? pool.find(a => a.filename === filename) : pool[0];
                 if (!wanted) {
                     return failure(
                         new BridgeError({
                             code: "not_found",
-                            message: `No attachment named ${filename}. Available: ${message.attachments.map(a => a.filename).join(", ")}`
+                            message: `No attachment named ${filename}. Available: ${pool.map(a => a.filename).join(", ")}`
                         })
                     );
                 }
@@ -713,6 +717,118 @@ export function createMcpServer(bridge: Bridge, cfg: Config, version: string): M
                         { timezone: cfg.timezone, ids: ids ?? false }
                     )
                 );
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_poll_voters",
+        {
+            title: "List who voted for a poll answer",
+            description:
+                "Expand a poll answer into the accounts that picked it. `discord_history` reports each answer as a bare count — this says which accounts make it up. Names a single answer with `answerId` (discord_history prints each answer's id), or expands every answer on the poll when that is omitted. Discord pages these 100 at a time, so a heavily-voted answer needs a higher `limit`.",
+            inputSchema: {
+                channelId: z.string().describe("Channel the message is in."),
+                messageId: z.string().describe("Id of the message that has the poll."),
+                answerId: z
+                    .number()
+                    .optional()
+                    .describe("Which answer, by its numeric id. Omit to expand every answer on the poll."),
+                limit: z
+                    .number()
+                    .optional()
+                    .describe("Voters to collect per answer (default 100, max 500). Anything short of the reported count is flagged in the output."),
+                ids: z.boolean().optional().describe("Tag every user with their account id, for cross-referencing.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ channelId, messageId, answerId, limit, ids }): Promise<TextResult> => {
+            try {
+                const res = await bridge.call("pollVoters", { channelId, messageId, answerId, limit });
+                assertAllowed(cfg, res.channel);
+
+                if (!res.message) {
+                    return failure(
+                        new BridgeError({ code: "not_found", message: `Message ${messageId} was not found in ${channelId}.` })
+                    );
+                }
+
+                return text(
+                    renderPollVoters(
+                        {
+                            channel: res.channel,
+                            message: pseudo.apply([res.message])[0]!,
+                            answers: res.answers.map(a => ({ ...a, users: pseudo.applyUsers(a.users) })),
+                            skipped: res.skipped
+                        },
+                        { timezone: cfg.timezone, ids: ids ?? false }
+                    )
+                );
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_members",
+        {
+            title: "List guild members currently loaded in the client",
+            description:
+                "List members of a guild from whatever the client already has cached — NOT a full roster. Discord only streams online members to a normal account once a guild passes roughly 1,000 people, so on a large server this is a partial, online-skewed slice, and the output says so. Filter with `roleId` (see discord_roles) or `query` (matches username or nickname) to narrow it.",
+            inputSchema: {
+                guildId: z.string().describe("Server id, from discord_guilds."),
+                roleId: z.string().optional().describe("Only members holding this role id — discord_roles lists them."),
+                query: z.string().optional().describe("Case-insensitive substring match against username or nickname."),
+                limit: z.number().optional().describe("Members to return (default 200, max 500)."),
+                ids: z.boolean().optional().describe("Tag every member with their account id, for cross-referencing.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ guildId, roleId, query, limit, ids }): Promise<TextResult> => {
+            try {
+                if (cfg.allowGuilds.length && !cfg.allowGuilds.includes(guildId)) {
+                    return failure(
+                        new BridgeError({ code: "forbidden", message: `Guild ${guildId} is not allowlisted.` })
+                    );
+                }
+
+                const res = await bridge.call("members", { guildId, roleId, query, limit });
+                const members = res.members.map(m => ({
+                    ...m,
+                    ...pseudo.applyUsers([{ id: m.id, username: m.username, displayName: m.displayName, bot: m.bot }])[0]!
+                }));
+
+                return text(renderMembers({ ...res, members }, { ids: ids ?? false }));
+            } catch (err) {
+                return failure(err);
+            }
+        }
+    );
+
+    server.registerTool(
+        "discord_roles",
+        {
+            title: "List a guild's roles",
+            description:
+                "List every role in a guild with its id, name and colour. Use the id with discord_members' `roleId` filter to find who holds a given role.",
+            inputSchema: {
+                guildId: z.string().describe("Server id, from discord_guilds.")
+            },
+            annotations: { readOnlyHint: true }
+        },
+        async ({ guildId }): Promise<TextResult> => {
+            try {
+                if (cfg.allowGuilds.length && !cfg.allowGuilds.includes(guildId)) {
+                    return failure(
+                        new BridgeError({ code: "forbidden", message: `Guild ${guildId} is not allowlisted.` })
+                    );
+                }
+
+                const res = await bridge.call("roles", { guildId });
+                return text(renderRoles(res));
             } catch (err) {
                 return failure(err);
             }

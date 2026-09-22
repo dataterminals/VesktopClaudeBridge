@@ -20,9 +20,12 @@ import type {
     BridgeChannel,
     BridgeDm,
     BridgeGuild,
+    BridgeMember,
     BridgeMessage,
+    BridgeRole,
     BridgeUser,
     MarkedItem,
+    PollAnswerVoters,
     ReactorGroup,
     SearchHit
 } from "./protocol.js";
@@ -433,6 +436,32 @@ export function compactMessages(input: BridgeMessage[], opts: CompactOptions): s
                       : " (body not loaded)"
                   : "";
             marks.push(`   ↳ replying to ${who}${what}`);
+        }
+
+        if (m.forwarded) {
+            const f = m.forwarded;
+            // Deliberately not the "discord_history around=<id>" phrasing the
+            // reply hint above uses — a forward's reference points at a
+            // different channel (often a different guild entirely), and that
+            // hint would send the reader looking for it in the wrong place.
+            const origin = f.originChannelName
+                ? `#${f.originChannelName}${f.originGuildName ? ` · ${f.originGuildName}` : ""}`
+                : f.originChannelId
+                  ? `channel ${f.originChannelId}${f.originGuildId ? ` in guild ${f.originGuildId}` : ""}`
+                  : "an unknown origin";
+            const when = f.timestamp ? `, ${at(f.timestamp, "datetime")}` : "";
+            marks.push(`   ↪ forwarded (from ${origin}${when})`);
+
+            const body = f.content.replace(/\s+/g, " ").trim();
+            if (body) marks.push(`     ${truncate(body, opts.truncateAt)}`);
+
+            for (const a of f.attachments) {
+                marks.push(`     [attachment] ${a.filename} · ${humanSize(a.size)} · ${a.contentType ?? "unknown type"}`);
+            }
+            for (const e of f.embeds) {
+                const bits = [e.title, e.description].filter(Boolean).join(" — ");
+                if (bits) marks.push(`     [embed] ${truncate(bits, 300)}`);
+            }
         }
 
         for (const a of m.attachments) {
@@ -855,6 +884,137 @@ export function renderReactors(input: ReactorRenderInput, opts: { timezone: stri
         lines.push(
             `── ${skipped} other reaction${skipped === 1 ? "" : "s"} on this message ${skipped === 1 ? "was" : "were"} not expanded — name one with \`emoji\` to read it.`
         );
+    }
+
+    return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Poll voters
+// ---------------------------------------------------------------------------
+
+export interface PollVotersRenderInput {
+    channel: BridgeChannel | null;
+    message: BridgeMessage;
+    answers: PollAnswerVoters[];
+    skipped: number;
+}
+
+/**
+ * Who voted for what, under a one-line reminder of which poll it was.
+ *
+ * Same shape as renderReactors on purpose — a poll answer and a reaction are
+ * both "a count that's actually a list of people", and a reader who already
+ * knows how to read one output should not have to learn a second layout.
+ */
+export function renderPollVoters(input: PollVotersRenderInput, opts: { timezone: string; ids?: boolean; }): string {
+    const { channel, message, answers, skipped } = input;
+
+    const where = channel
+        ? `${channel.isDm ? "" : "#"}${channel.name}${channel.isThread ? " (thread)" : ""}`
+        : "(unknown channel)";
+    const when = stamper(opts.timezone)(message.timestamp, "datetime");
+    const question = message.poll?.question ?? excerptOf(message) ?? "(no question)";
+
+    const lines = [
+        `── poll voters · ${where} · msg ${message.id}`,
+        `── ${message.author.displayName}, ${when} · ${zoneNote(opts.timezone)}`,
+        `── "${question}"`
+    ];
+
+    if (!answers.length) return `${lines.join("\n")}\n\nThis poll has no answers.`;
+
+    for (const a of answers) {
+        const shown = a.users.length;
+        const note = a.error
+            ? ` — could not be read: ${a.error}`
+            : a.truncated
+              ? ` — showing ${shown} of ${a.count ?? "an unknown count"}; raise limit to page further`
+              : a.count !== null && shown !== a.count
+                ? ` — showing ${shown}, the poll reports ${a.count}`
+                : "";
+
+        const label = [a.emoji, a.text ?? `answer ${a.answerId}`].filter(Boolean).join(" ");
+        lines.push("");
+        lines.push(`${label} · ${a.count ?? shown}${note}`);
+        if (shown) {
+            lines.push(`   ${a.users.map(u => (opts.ids ? `${u.displayName} ⟨${u.id}⟩` : u.displayName)).join(", ")}`);
+        } else if (!a.error) {
+            lines.push("   (none returned)");
+        }
+    }
+
+    if (skipped > 0) {
+        lines.push("");
+        lines.push(
+            `── ${skipped} other answer${skipped === 1 ? "" : "s"} on this poll ${skipped === 1 ? "was" : "were"} not expanded — name one with \`answerId\` to read it.`
+        );
+    }
+
+    return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Members and roles
+// ---------------------------------------------------------------------------
+
+export interface MembersRenderInput {
+    guild: BridgeGuild | null;
+    members: BridgeMember[];
+    scanned: number;
+    truncated: boolean;
+}
+
+/**
+ * A guild's members, from whatever the client already has cached.
+ *
+ * The incompleteness is the first thing printed, not a footnote: Discord only
+ * streams online members to a normal account once a guild passes roughly a
+ * thousand of them, so silence about that here would read as a real roster
+ * rather than the partial, online-skewed slice it actually is.
+ */
+export function renderMembers(input: MembersRenderInput, opts: { ids?: boolean; }): string {
+    const { guild, members, scanned, truncated } = input;
+    const where = guild ? guild.name : "(unknown guild)";
+
+    const lines = [
+        `── members · ${where}`,
+        `── loaded slice only, not a full roster — Discord streams only online members to a normal account once a guild passes roughly 1,000 people; ${scanned} matched in what the client currently has cached.`
+    ];
+
+    if (!members.length) return `${lines.join("\n")}\n\nNo members matched.`;
+
+    lines.push("");
+    for (const m of members) {
+        const idTag = opts.ids ? ` ⟨${m.id}⟩` : "";
+        const roleList = m.roles.length ? ` · ${m.roles.join(", ")}` : "";
+        lines.push(`${m.displayName}${m.bot ? " [bot]" : ""}${idTag}${roleList}`);
+    }
+
+    if (truncated) {
+        lines.push("");
+        lines.push("── more matched than shown — raise limit, or narrow with roleId/query.");
+    }
+
+    return lines.join("\n");
+}
+
+export interface RolesRenderInput {
+    guild: BridgeGuild | null;
+    roles: BridgeRole[];
+}
+
+/** A guild's roles, highest position first — feed an id to `members`' roleId filter. */
+export function renderRoles(input: RolesRenderInput): string {
+    const { guild, roles } = input;
+    const where = guild ? guild.name : "(unknown guild)";
+
+    const lines = [`── roles · ${where}`];
+    if (!roles.length) return `${lines.join("\n")}\n\nNo roles found.`;
+
+    lines.push("");
+    for (const r of roles) {
+        lines.push(`${r.id}  ${r.name}${r.hoist ? " · hoisted" : ""}`);
     }
 
     return lines.join("\n");

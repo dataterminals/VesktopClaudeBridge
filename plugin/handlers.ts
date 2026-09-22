@@ -11,9 +11,12 @@ import {
     currentUser,
     fail,
     fetchMessages,
+    fetchPollVoters,
     fetchReactors,
     listChannels,
     listDms,
+    listGuildMembers,
+    listGuildRoles,
     listGuilds,
     parseMessageLink,
     searchMessages,
@@ -24,7 +27,7 @@ import {
 } from "./discord";
 import { clearMarks, listMarks } from "./marked";
 import { drain as drainThirdEye, noteRead, state as thirdEyeState } from "./thirdEye";
-import type { ReactorGroup, RpcMethod, RpcParams, RpcResults } from "./protocol";
+import type { PollAnswerVoters, ReactorGroup, RpcMethod, RpcParams, RpcResults } from "./protocol";
 import { settings } from "./settings";
 
 import { ChannelStore, GuildStore } from "@webpack/common";
@@ -52,6 +55,21 @@ const MAX_REACTORS = 500;
  * out is reported as `skipped` rather than silently dropped.
  */
 const MAX_REACTION_GROUPS = 6;
+
+/** Voter budget, same reasoning as MAX_REACTORS. */
+const MAX_POLL_VOTERS = 500;
+
+/** Discord caps a poll at 10 answers, so this is a backstop rather than a real limit. */
+const MAX_POLL_ANSWERS = 10;
+
+/**
+ * Member listing budget.
+ *
+ * A guild-scoped roster read, not a paginated one — the caller narrows with
+ * `roleId`/`query` rather than paging, so this just needs to be generous
+ * enough that a reasonable narrow query never silently truncates.
+ */
+const MAX_MEMBERS = 500;
 
 export const handlers: Record<RpcMethod, RpcHandler> = {
     async ping(): Promise<RpcResults["ping"]> {
@@ -259,6 +277,100 @@ export const handlers: Record<RpcMethod, RpcHandler> = {
             message,
             groups,
             skipped: matching.length - expand.length
+        };
+    },
+
+    async pollVoters(params: RpcParams["pollVoters"]): Promise<RpcResults["pollVoters"]> {
+        if (!params?.channelId) throw fail("bad_params", "channelId is required");
+        if (!params?.messageId) throw fail("bad_params", "messageId is required");
+
+        // Same reasoning as reactors: re-fetch first so a wrong id fails with a
+        // reason here instead of an opaque 400 from the poll-answers route.
+        const page = await fetchMessages({
+            channelId: params.channelId,
+            limit: 1,
+            around: params.messageId
+        });
+        const message = page.find(m => m.id === params.messageId) ?? null;
+        if (!message) {
+            throw fail(
+                "not_found",
+                `No message ${params.messageId} in channel ${params.channelId} — it may have been deleted.`
+            );
+        }
+        if (!message.poll) {
+            throw fail("bad_params", `Message ${params.messageId} has no poll.`);
+        }
+
+        const matching =
+            params.answerId != null
+                ? message.poll.answers.filter(a => a.id === params.answerId)
+                : message.poll.answers;
+
+        if (params.answerId != null && !matching.length) {
+            const present = message.poll.answers.map(a => `${a.id}:${a.text ?? a.emoji ?? "?"}`).join(", ");
+            throw fail(
+                "not_found",
+                `No answer ${params.answerId} on that poll. It has: ${present || "(none)"}`
+            );
+        }
+
+        const expand = matching.slice(0, MAX_POLL_ANSWERS);
+        const limit = Math.max(1, Math.min(params.limit ?? 100, MAX_POLL_VOTERS));
+
+        const answers: PollAnswerVoters[] = [];
+        for (const answer of expand) {
+            const { users, truncated, error } = await fetchPollVoters(
+                params.channelId,
+                params.messageId,
+                answer,
+                limit
+            );
+            answers.push({
+                answerId: answer.id,
+                text: answer.text,
+                emoji: answer.emoji,
+                emojiId: answer.emojiId,
+                count: answer.count,
+                users,
+                truncated,
+                error
+            });
+        }
+
+        return {
+            channel: toBridgeChannel(ChannelStore.getChannel(params.channelId)),
+            message,
+            answers,
+            skipped: matching.length - expand.length
+        };
+    },
+
+    async members(params: RpcParams["members"]): Promise<RpcResults["members"]> {
+        if (!params?.guildId) throw fail("bad_params", "guildId is required");
+
+        const all = listGuildMembers(params.guildId, params.roleId);
+        const q = params.query?.toLowerCase().trim();
+        const matched = q
+            ? all.filter(m => m.username.toLowerCase().includes(q) || m.displayName.toLowerCase().includes(q))
+            : all;
+
+        const limit = Math.max(1, Math.min(params.limit ?? 200, MAX_MEMBERS));
+        const page = matched.slice(0, limit);
+
+        return {
+            guild: toBridgeGuild(GuildStore.getGuild(params.guildId)),
+            members: page,
+            scanned: matched.length,
+            truncated: matched.length > page.length
+        };
+    },
+
+    async roles(params: RpcParams["roles"]): Promise<RpcResults["roles"]> {
+        if (!params?.guildId) throw fail("bad_params", "guildId is required");
+        return {
+            guild: toBridgeGuild(GuildStore.getGuild(params.guildId)),
+            roles: listGuildRoles(params.guildId)
         };
     }
 };

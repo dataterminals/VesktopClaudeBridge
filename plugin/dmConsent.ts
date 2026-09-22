@@ -112,11 +112,19 @@ const REACHES: Record<RpcMethod, (params: any) => string[]> = {
     "marked.clear": () => [],
     "third_eye.state": () => [],
 
+    // Guild-scoped by construction — a member list or role list has no DM
+    // equivalent, same reasoning as guilds/channels above.
+    members: () => [],
+    roles: () => [],
+
     dms: () => [LISTING_KEY],
 
     current_view: () => dmKey(SelectedChannelStore.getChannelId()),
     history: params => dmKey(params?.channelId),
     reactors: params => dmKey(params?.channelId),
+    // Polls can sit in a DM same as any other message, so this is channel-scoped
+    // exactly like reactors.
+    pollVoters: params => dmKey(params?.channelId),
 
     // A search with a guildId is scoped to that guild and cannot return a DM.
     // Without one it is a DM search, and channelId names which.

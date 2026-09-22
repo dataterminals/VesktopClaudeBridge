@@ -35,12 +35,15 @@ import type {
     BridgeChannel,
     BridgeDm,
     BridgeEmbed,
+    BridgeForward,
     BridgeGuild,
+    BridgeMember,
     BridgeMessage,
     BridgePoll,
     BridgePollAnswer,
     BridgeReaction,
     BridgeReplyRef,
+    BridgeRole,
     BridgeUser,
     RpcError
 } from "./protocol";
@@ -93,8 +96,25 @@ export function toBridgeUser(raw: any, guildId: string | null): BridgeUser {
         id,
         username,
         displayName: nick || raw?.globalName || raw?.global_name || username,
-        bot: Boolean(raw?.bot)
+        bot: Boolean(raw?.bot),
+        roles: guildId ? resolveRoleNames(guildId, id) : undefined
     };
+}
+
+/**
+ * A member's role names, resolved from what the client already has cached —
+ * no network call, since both stores hold the guild's whole state locally.
+ *
+ * Returns undefined rather than [] when nothing resolved, so "holds no roles"
+ * and "the client has no record of this member" don't collapse into the same
+ * empty array on the wire.
+ */
+function resolveRoleNames(guildId: string, userId: string): string[] | undefined {
+    const roleIds: string[] | undefined = GuildMemberStore?.getMember?.(guildId, userId)?.roles;
+    if (!Array.isArray(roleIds) || !roleIds.length) return undefined;
+    const snapshot = GuildRoleStore.getRolesSnapshot(guildId);
+    const names = roleIds.map(id => snapshot?.[id]?.name).filter((n): n is string => Boolean(n));
+    return names.length ? names : undefined;
 }
 
 export function currentUser(): BridgeUser | null {
@@ -314,10 +334,14 @@ function toReaction(raw: any): BridgeReaction {
 function toPollAnswer(raw: any, counts: Map<number, { count: number; me: boolean; }>): BridgePollAnswer {
     const id = Number(raw?.answer_id ?? raw?.answerId ?? 0);
     const media = raw?.poll_media ?? raw?.pollMedia ?? {};
+    // Same shape as a reaction's emoji — see toReaction.
+    const emoji = media?.emoji ?? {};
     const tally = counts.get(id);
     return {
         id,
         text: media?.text ?? null,
+        emoji: emoji.id ? `:${emoji.name}:` : (emoji.name ?? null),
+        emojiId: emoji.id ? String(emoji.id) : null,
         count: tally ? tally.count : null,
         me: tally ? tally.me : false
     };
@@ -368,9 +392,15 @@ function toPoll(raw: any): BridgePoll | null {
     };
 }
 
+/** Discord's message_reference.type for a forward, as opposed to 0 for a reply. */
+const REFERENCE_TYPE_FORWARD = 1;
+
 function toReplyRef(raw: any, channelId: string, guildId: string | null): BridgeReplyRef | null {
     const ref = raw?.messageReference ?? raw?.message_reference;
-    if (!ref) return null;
+    // A forward carries the same reference shape as a reply, but points at
+    // content in message_snapshots rather than referenced_message — see
+    // toForward, which handles this case instead.
+    if (!ref || ref.type === REFERENCE_TYPE_FORWARD) return null;
 
     const referencedId = ref.message_id ? String(ref.message_id) : null;
 
@@ -394,6 +424,41 @@ function toReplyRef(raw: any, channelId: string, guildId: string | null): Bridge
     };
 }
 
+/**
+ * The forwarded message's own content, when `raw` is a forward.
+ *
+ * Discord ships the forwarded message under `message_snapshots[0].message`
+ * rather than `referenced_message`, and the reference beside it names the
+ * *origin* channel/guild — often one this client has never opened, unlike a
+ * reply's target, which lives in the same channel as the reply itself. Origin
+ * names are resolved best-effort from whatever the client already has cached;
+ * an unresolvable id is left for the sidecar to print rather than guessed at.
+ */
+function toForward(raw: any, guildId: string | null): BridgeForward | null {
+    const ref = raw?.messageReference ?? raw?.message_reference;
+    if (ref?.type !== REFERENCE_TYPE_FORWARD) return null;
+
+    const snapshot = (raw?.messageSnapshots ?? raw?.message_snapshots)?.[0]?.message;
+    if (!snapshot) return null;
+
+    const originChannelId = ref.channel_id ? String(ref.channel_id) : null;
+    const originGuildId = ref.guild_id ? String(ref.guild_id) : null;
+    // Resolved in the origin guild's context, not the forwarding channel's —
+    // mentions inside the forwarded body belong to wherever it came from.
+    const contentGuildId = originGuildId ?? guildId;
+
+    return {
+        content: resolveContent(snapshot.content ?? "", contentGuildId),
+        attachments: Array.isArray(snapshot.attachments) ? snapshot.attachments.map(toAttachment) : [],
+        embeds: Array.isArray(snapshot.embeds) ? snapshot.embeds.map(toEmbed) : [],
+        timestamp: toIso(snapshot.timestamp),
+        originChannelId,
+        originChannelName: originChannelId ? (ChannelStore.getChannel(originChannelId)?.name ?? null) : null,
+        originGuildId,
+        originGuildName: originGuildId ? (GuildStore.getGuild(originGuildId)?.name ?? null) : null
+    };
+}
+
 export function toBridgeMessage(raw: any, channel: BridgeChannel | null): BridgeMessage {
     const channelId = String(raw?.channel_id ?? channel?.id ?? "0");
     const guildId = channel?.guildId ?? null;
@@ -411,6 +476,7 @@ export function toBridgeMessage(raw: any, channel: BridgeChannel | null): Bridge
         editedTimestamp: toIso(raw?.editedTimestamp ?? raw?.edited_timestamp),
         content: resolveContent(raw?.content ?? "", guildId),
         replyTo: toReplyRef(raw, channelId, guildId),
+        forwarded: toForward(raw, guildId),
         attachments: Array.isArray(raw?.attachments) ? raw.attachments.map(toAttachment) : [],
         embeds: Array.isArray(raw?.embeds) ? raw.embeds.map(toEmbed) : [],
         reactions: Array.isArray(raw?.reactions) ? raw.reactions.map(toReaction) : [],
@@ -773,6 +839,81 @@ export async function fetchReactors(
     return { users, burst, error: null, truncated: !ranOut && users.length < reaction.count };
 }
 
+/** Discord's ceiling on `limit` for the poll-answer-voters route, same shape as reactions. */
+const MAX_POLL_VOTERS_PER_REQUEST = 100;
+
+/**
+ * Who voted for one poll answer, not just how many.
+ *
+ * Mirrors fetchReactors above, minus the plain/super split — a poll vote has
+ * no equivalent of a super reaction, so this pages one list to exhaustion or
+ * to `limit`. A rejection is reported rather than thrown, so one unreadable
+ * answer doesn't lose the others on the same poll.
+ */
+export async function fetchPollVoters(
+    channelId: string,
+    messageId: string,
+    answer: BridgePollAnswer,
+    limit: number
+): Promise<{ users: BridgeUser[]; truncated: boolean; error: string | null; }> {
+    const url = `/channels/${channelId}/polls/${messageId}/answers/${answer.id}`;
+    const guildId = toBridgeChannel(ChannelStore.getChannel(channelId))?.guildId ?? null;
+
+    const users: BridgeUser[] = [];
+    const seen = new Set<string>();
+    let after: string | undefined;
+    let ranOut = false;
+
+    try {
+        while (users.length < limit) {
+            const want = Math.min(limit - users.length, MAX_POLL_VOTERS_PER_REQUEST);
+            const response = await RestAPI.get({
+                url,
+                query: after ? { limit: want, after } : { limit: want },
+                retries: 2
+            });
+
+            const page: any[] = Array.isArray(response?.body?.users) ? response.body.users : [];
+            for (const u of page) {
+                const mapped = toBridgeUser(u, guildId);
+                if (seen.has(mapped.id)) continue;
+                seen.add(mapped.id);
+                users.push(mapped);
+            }
+
+            // A short page is the end of the list — there is no cursor past it.
+            if (page.length < want) {
+                ranOut = true;
+                break;
+            }
+
+            after = page[page.length - 1]?.id;
+            if (!after) {
+                ranOut = true;
+                break;
+            }
+        }
+    } catch (err: any) {
+        const status = err?.status ?? err?.body?.code;
+        return {
+            users,
+            truncated: false,
+            error:
+                status === 403
+                    ? `no permission to read poll votes in channel ${channelId}`
+                    : `Discord rejected the request (${status ?? "unknown"})`
+        };
+    }
+
+    // Stopped on the caller's budget rather than on Discord running out, so say
+    // whether anything was actually left behind.
+    return {
+        users,
+        error: null,
+        truncated: !ranOut && answer.count !== null && users.length < answer.count
+    };
+}
+
 export function listGuilds(): BridgeGuild[] {
     const guilds: Record<string, any> = GuildStore.getGuilds() ?? {};
     return Object.values(guilds)
@@ -795,6 +936,48 @@ export function listChannels(guildId: string): BridgeChannel[] {
     }
 
     return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Guild members currently loaded in the client's cache — never the full
+ * roster on a guild past Discord's ~1,000-member online-streaming cutoff.
+ *
+ * `GuildMemberStore.getMembers` hands back everything the client has, which
+ * on a large server skews toward whoever is online or was recently active;
+ * that incompleteness is the caller's to disclose, not this function's to
+ * paper over. `roleId` filters against the raw per-member role-id array
+ * before role names are resolved, since BridgeMember only carries names.
+ */
+export function listGuildMembers(guildId: string, roleId?: string): BridgeMember[] {
+    const members: any[] = GuildMemberStore.getMembers(guildId) ?? [];
+    const filtered = roleId ? members.filter(m => Array.isArray(m?.roles) && m.roles.includes(roleId)) : members;
+    const roleSnapshot = GuildRoleStore.getRolesSnapshot(guildId);
+
+    return filtered.map(m => {
+        const id = String(m.userId);
+        const user = UserStore.getUser(id);
+        const roleIds: string[] = Array.isArray(m?.roles) ? m.roles : [];
+        return {
+            id,
+            username: user?.username ?? "unknown",
+            displayName: m.nick || user?.globalName || user?.username || "unknown",
+            bot: Boolean(user?.bot),
+            roles: roleIds.map(rid => roleSnapshot?.[rid]?.name).filter((n): n is string => Boolean(n)),
+            joinedAt: toIso(m.joinedAt)
+        };
+    });
+}
+
+/** Every role in a guild, sorted highest-position first like Discord's own role list. */
+export function listGuildRoles(guildId: string): BridgeRole[] {
+    const roles: any[] = GuildRoleStore.getSortedRoles(guildId) ?? [];
+    return roles.map(r => ({
+        id: String(r.id),
+        name: r.name,
+        color: Number(r.color ?? 0),
+        position: Number(r.position ?? 0),
+        hoist: Boolean(r.hoist)
+    }));
 }
 
 /**
