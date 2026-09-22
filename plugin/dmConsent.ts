@@ -254,7 +254,8 @@ export async function requestDmAccess(method: RpcMethod, params: unknown): Promi
             "forbidden",
             `Refused by the Discord plugin: access to ${describe(cooling)} was declined, and the bridge will not ask ` +
                 `again for ${minutesLeft(refusedFor(cooling))}. Do not retry — ask the user to approve it in Discord, ` +
-                'or to set "DM access" to "Always allow" in the plugin settings.'
+                'or to tick "Let Claude read DMs without asking" in the menu behind the Claude bridge button on the ' +
+                "chat bar."
         );
     }
 

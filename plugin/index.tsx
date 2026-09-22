@@ -24,6 +24,7 @@ import {
     toBridgeGuild,
     toBridgeMessage
 } from "./discord";
+import { accessMode } from "./dmConsent";
 import { loadDmLedger } from "./dmLedger";
 import { handlers, snapshotCurrentChannel } from "./handlers";
 import { type CopyableId, messageHome, messageIds, noun } from "./ids";
@@ -262,6 +263,39 @@ async function toggleThirdEye() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// DM prompts
+// ---------------------------------------------------------------------------
+
+/**
+ * Flips DM access between asking and not asking, from the chat bar.
+ *
+ * This writes the "DM access" setting itself rather than keeping a switch of its
+ * own beside it. There are four DM switches across two processes already, and a
+ * fifth that could disagree with the settings page would be one more place to go
+ * looking when a DM gets refused. Writing the setting also runs the onChange in
+ * settings.ts exactly as the settings page does — Equicord registers it as a
+ * store listener (Equicord src/api/PluginManager.ts:448), not as a UI callback —
+ * so turning prompts back on drops every temporary grant from here too.
+ *
+ * It never leaves Off. That mode is the master switch, and one that sits a
+ * misclick in the chat bar away from its opposite is not a master switch; the
+ * menu shows it as a status line instead, and changing it stays a trip to
+ * settings.
+ */
+function toggleDmPrompts() {
+    const mode = accessMode();
+    if (mode === "off") return;
+
+    settings.store.dmAccess = mode === "allow" ? "ask" : "allow";
+    toast(
+        mode === "allow"
+            ? "Claude asks before reading your DMs again"
+            : "Claude can read your DMs without asking — stays on until you untick it",
+        Toasts.Type.MESSAGE
+    );
+}
+
 async function markCurrentChannel() {
     try {
         const snapshot = await snapshotCurrentChannel();
@@ -359,13 +393,17 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, props: a
 
 /**
  * There is exactly one chat-bar button per plugin — `addChatBarButton` is keyed
- * by plugin name — so grabbing and watching share it via a menu rather than one
- * of them becoming an invisible right-click gesture.
+ * by plugin name — so grabbing, watching and the DM switch share it via a menu
+ * rather than any of them becoming an invisible right-click gesture.
  */
 function BridgeMenu() {
     const watching = isWatching();
     const st = thirdEyeState();
     const queued = markCount();
+    // Subscribed, not just read: clicking the tick changes the setting while
+    // this menu is still mounted, and nothing else would re-render it.
+    settings.use(["dmAccess"]);
+    const dmMode = accessMode();
 
     return (
         <Menu.Menu
@@ -382,7 +420,7 @@ function BridgeMenu() {
               * Hidden at zero rather than disabled. The disabled precedent below
               * is a *status* line, which is worth stating even when it reads
               * nothing; "Clear the queue (0 marked)" is just a dead control in a
-              * four-item menu, and the count is the label's whole job.
+              * menu this short, and the count is the label's whole job.
               *
               * It sits with the marking item, above the separator, so mark
               * actions are one group and third eye stays its own.
@@ -410,11 +448,35 @@ function BridgeMenu() {
                     action={() => {}}
                 />
             )}
+            <Menu.MenuSeparator />
+            {/*
+              * Under Off this is a status line rather than a disabled checkbox:
+              * a greyed tick box says "not now" without saying why, and the why
+              * is the whole message. See toggleDmPrompts for why it can't be
+              * flipped from here.
+              */}
+            {dmMode === "off" ? (
+                <Menu.MenuItem
+                    id="vcb-dm-access-off"
+                    label="DM access is off in plugin settings"
+                    disabled={true}
+                    action={() => {}}
+                />
+            ) : (
+                <Menu.MenuCheckboxItem
+                    id="vcb-dm-prompts"
+                    label="Let Claude read DMs without asking"
+                    checked={dmMode === "allow"}
+                    action={() => toggleDmPrompts()}
+                />
+            )}
         </Menu.Menu>
     );
 }
 
 const GrabChannelButton: ChatBarButtonFactory = ({ isMainChat }) => {
+    // Above the early return because it is a hook. Feeds the tooltip's DM note.
+    settings.use(["dmAccess"]);
     if (!isMainChat) return null;
 
     const st = thirdEyeState();
@@ -429,13 +491,18 @@ const GrabChannelButton: ChatBarButtonFactory = ({ isMainChat }) => {
     // reads as noise rather than as information.
     const queued = markCount();
 
-    const tooltip = !st.watching
+    const activity = !st.watching
         ? queued > 0
             ? `Claude bridge — ${queued} marked · mark more, or start third eye`
             : "Claude bridge — mark messages, or start third eye"
         : here
           ? `Third eye: armed · ${st.pending} buffered · ${st.notablePending} for you`
           : `Third eye: armed on #${st.channel?.name ?? "?"} · ${st.pending} buffered`;
+
+    // This one goes on every branch, unlike the queue count. It is not a number
+    // that moves but a standing permission, and one ticked last week should be
+    // noticeable without opening the menu to check.
+    const tooltip = accessMode() === "allow" ? `${activity} · DMs readable without asking` : activity;
 
     return (
         <ChatBarButton tooltip={tooltip} onClick={e => ContextMenuApi.openContextMenu(e, () => <BridgeMenu />)}>

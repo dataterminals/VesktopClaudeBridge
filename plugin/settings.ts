@@ -109,7 +109,7 @@ export const settings = definePluginSettings({
     dmAccess: {
         type: OptionType.SELECT,
         description:
-            "What happens when something asks to read one of your DMs. This gate lives in Discord, so it refuses before anything leaves the client at all — unlike the sidecar's denyDms, which refuses content that has already crossed over.",
+            "What happens when something asks to read one of your DMs. This gate lives in Discord, so it refuses before anything leaves the client at all — unlike the sidecar's denyDms, which refuses content that has already crossed over. The Claude bridge button on the chat bar flips this between Ask and Always allow too: \"Let Claude read DMs without asking\" in its menu is this same setting.",
         options: [
             {
                 label: "Ask me each time (recommended)",
